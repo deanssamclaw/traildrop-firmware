@@ -3,6 +3,7 @@
 // Reference: RNS/Packet.py (announce handling)
 // TODO: Phase 3 implementation
 
+#include <cstddef>
 #include "net/destination.h"
 #include "crypto/identity.h"
 
