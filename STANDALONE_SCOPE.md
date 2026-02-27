@@ -8,7 +8,7 @@ Pick it up, turn it on, drop and share waypoints over LoRa radio.
 - **MCU:** ESP32-S3 (dual-core, 16MB flash, 8MB PSRAM)
 - **Radio:** SX1262 LoRa (915 MHz for US)
 - **Screen:** 2.8" ST7789 IPS LCD, 320×240
-- **Input:** Physical keyboard + trackball
+- **Input:** Physical keyboard (I2C 0x55 via ESP32-C3 controller) + trackball (GPIO pulse, not I2C)
 - **GPS:** Built-in module (UART on pins 43/44)
 - **Audio:** Speaker + microphone (ES7210)
 - **Power:** 2000mAh battery
@@ -54,14 +54,16 @@ Add features incrementally.
 ### Phase 1: Hardware Bringup (1-2 days)
 Get all peripherals working individually in Arduino/PlatformIO.
 
-- [ ] Screen: ST7789 via TFT_eSPI library — display text, basic graphics
-- [ ] Keyboard: I2C read from ESP32-C3 keyboard controller
-- [ ] Trackball: Navigation input
-- [ ] GPS: UART serial read, parse NMEA sentences (TinyGPS++ library)
-- [ ] LoRa: SX1262 init + raw packet send/receive (RadioLib library)
-- [ ] SD card: Read/write files for waypoint storage
-- [ ] Battery: ADC read for battery level display
-- [ ] Power management: Deep sleep, wake on keypress
+- [x] Screen: ST7789 via TFT_eSPI library — display text, basic graphics *(implemented, pending hardware verify)*
+- [x] Keyboard: I2C read from ESP32-C3 keyboard controller at 0x55 *(implemented, pending hardware verify)*
+- [x] Trackball: GPIO pulse navigation input (UP/DOWN/LEFT/RIGHT/CLICK) *(implemented, pending hardware verify)*
+- [x] GPS: UART serial read, parse NMEA sentences (TinyGPS++ library) *(implemented, pending hardware verify)*
+- [x] LoRa: SX1262 init + raw packet send/receive (RadioLib library) *(implemented, pending hardware verify)*
+- [x] SD card: Read/write files for waypoint storage *(implemented, pending hardware verify)*
+- [x] Battery: ADC read for battery level display *(implemented, linear approx)*
+- [x] Power management: Deep sleep, wake on keypress *(implemented, pending hardware verify)*
+- [ ] **Test harness:** Compile-clean main_test.cpp exercising all HAL modules *(in progress)*
+- [ ] **Hardware verification:** Flash to T-Deck Plus and confirm each peripheral
 
 **Libraries:**
 - `TFT_eSPI` — display driver
@@ -71,6 +73,24 @@ Get all peripherals working individually in Arduino/PlatformIO.
 - `ArduinoJson` — message serialization
 
 **Risk:** Low. All peripherals have working example code from LilyGO.
+
+#### Phase 1 Findings (Feb 2026)
+
+**Status:** HAL drivers implemented, test harness in progress, pending hardware verification.
+
+**Critical boot order:** `power_init()` MUST run first. It enables peripheral power (PIN 10 HIGH) and deselects all SPI chip-select lines (display CS=12, radio CS=9, SD CS=39). Without this, the shared SPI bus is in an undefined state and any peripheral init can fail or corrupt others.
+
+**Shared SPI bus (display + radio + SD card):** All three share MOSI/MISO/SCK pins. Currently safe because Phase 1 uses peripherals sequentially. In Phase 3+, concurrent radio RX and SD writes will need a mutex or strict CS sequencing to prevent bus corruption. Flag this before starting Phase 3.
+
+**Trackball is GPIO, not I2C:** Uses 4 directional pins (UP=3, DOWN=15, LEFT=1, RIGHT=2) + click (pin 0, shared with BOOT). Each pin toggles state on movement — detection is by polling for state changes. This means:
+- UI navigation needs a consistent polling rate or interrupts to avoid missing fast movements
+- Current implementation polls in main loop — adequate for Phase 1, may need ISR upgrade for Phase 5 UI
+
+**Radio CRC disabled intentionally:** Reticulum handles its own integrity checking. Don't "fix" this — it's correct for interop.
+
+**Battery voltage curve:** Linear approximation (3.0V=0%, 4.2V=100%). LiPo discharge is actually nonlinear. Fine for Phase 1 status display. Consider a lookup table for Phase 5 if accurate battery % matters.
+
+**TCXO voltage:** Set to 1.8V for DIO3. DIO2 configured as RF switch. These are T-Deck Plus specific — other SX1262 boards may differ.
 
 ### Phase 2: Crypto Foundation (2-3 days)
 Implement the cryptographic primitives Reticulum requires.
@@ -87,6 +107,8 @@ Implement the cryptographic primitives Reticulum requires.
 - Alternative: `Mbed TLS` (included in ESP-IDF) — also has everything needed
 
 **Risk:** Low. ESP32-S3 has hardware crypto acceleration. libsodium is well-ported to ESP-IDF.
+
+**Phase 1 insight:** The dual `espidf, arduino` framework in platformio.ini confirms ESP-IDF components (including libsodium) are directly available alongside Arduino libraries. No framework migration needed — this phase is de-risked.
 
 ### Phase 3: Reticulum Wire Protocol (3-5 days)
 Implement the packet format to be interoperable with Python Reticulum nodes.
@@ -108,6 +130,8 @@ Implement the packet format to be interoperable with Python Reticulum nodes.
 
 **Risk:** Medium. The wire format isn't formally documented — must reverse-engineer
 from Python source. But it's clean code and others have done partial ports.
+
+**Phase 1 insight:** Radio driver already disables hardware CRC and uses ISR-driven receive (sets a flag on DIO1 interrupt). `transport_poll()` can simply check that flag and read the buffer — clean integration, no architectural rework. **⚠️ SPI mutex needed:** Radio receive can fire while SD card is being accessed. Add a shared SPI mutex before starting this phase.
 
 ### Phase 4: LXMF Message Layer (2-3 days)
 Implement the LXMF message format for waypoint exchange.
@@ -142,6 +166,8 @@ Build the on-device interface using LVGL.
 
 **Risk:** Medium. LVGL has a learning curve but T-Deck examples exist.
 The keyboard/trackball integration is the tricky part.
+
+**Phase 1 insight:** Display currently uses TFT_eSPI directly. LVGL needs to be wired to use TFT_eSPI as its display backend — this is a known integration pattern but it's a distinct setup step before any UI work begins. Budget a half-day for LVGL↔TFT_eSPI bridge + trackball input driver registration. Trackball's GPIO polling approach may need ISR upgrade for responsive UI navigation.
 
 ### Phase 6: Storage & Persistence (1-2 days)
 - [ ] SQLite on SD card (or LittleFS on flash for small datasets)
