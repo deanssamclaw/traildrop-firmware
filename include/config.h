@@ -34,6 +34,9 @@
 #define RADIO_CR            6
 #define RADIO_TX_POWER_DBM  7     // Conservative default, max 22
 #define RADIO_PREAMBLE_LEN  8
+#define RADIO_TCXO_VOLTAGE  1.8f    // DIO3 TCXO reference voltage
+#define RADIO_SYNC_WORD     0xAB
+#define RADIO_CURRENT_LIMIT 140.0f  // mA
 
 // --- GPS (UART) ---
 #define PIN_GPS_TX          43
@@ -46,15 +49,26 @@
 
 // --- Keyboard ---
 #define PIN_KEYBOARD_INT    46
+#define KEYBOARD_I2C_ADDR   0x55
+#define KB_BRIGHTNESS_CMD   0x01
 
-// --- Trackball / Touch ---
+// --- Trackball (GPIO-based, not I2C) ---
+#define PIN_TRACKBALL_UP    3
+#define PIN_TRACKBALL_DOWN  15
+#define PIN_TRACKBALL_LEFT  1
+#define PIN_TRACKBALL_RIGHT 2
+#define PIN_TRACKBALL_CLICK 0     // Shared with BOOT button
+
+// --- Touch ---
 #define PIN_TOUCH_INT       16
 
 // --- SD Card ---
 #define PIN_SDCARD_CS       39
+#define SD_INIT_FREQ        800000U // 800 kHz for initialization
 
 // --- Battery ---
 #define PIN_BAT_ADC         4
+#define BAT_VOLTAGE_DIVIDER 2.11f   // Calibrated voltage divider multiplier
 
 // --- Audio (ES7210) ---
 #define PIN_I2S_WS          5
