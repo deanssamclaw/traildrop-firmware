@@ -26,6 +26,8 @@ bool power_init() {
 }
 
 void power_deep_sleep() {
+    // Wake on BOOT button (GPIO 0, active LOW)
+    esp_sleep_enable_ext0_wakeup((gpio_num_t)PIN_BOOT, 0);
     digitalWrite(PIN_BOARD_POWER, LOW);
     esp_deep_sleep_start();
 }

@@ -38,36 +38,50 @@ void setup() {
     Serial.printf("\n🦉 TrailDrop %s\n", APP_VERSION);
     Serial.println("Initializing...");
 
-    // Phase 1: Hardware bringup
-    hal::power_init();
-    hal::display_init();
-    hal::keyboard_init();
-    hal::trackball_init();
-    hal::gps_init();
-    hal::radio_init();
-    hal::storage_init();
-    hal::battery_init();
+    // Phase 1: Hardware bringup (power_init MUST be first — enables peripherals + deselects SPI CS)
+    bool ok = true;
+    ok &= hal::power_init();
+    ok &= hal::display_init();
+
+    // Display errors on screen — backcountry user won't have serial monitor
+    auto check = [&](const char* name, bool result) {
+        if (!result) {
+            Serial.printf("[BOOT] %s: FAIL\n", name);
+            hal::display_printf(0, 0, 0xF800, 2, "FAIL: %s", name);
+        } else {
+            Serial.printf("[BOOT] %s: OK\n", name);
+        }
+        ok &= result;
+    };
+
+    check("Power", ok);
+    check("Display", ok);
+    check("Keyboard", hal::keyboard_init());
+    check("Trackball", hal::trackball_init());
+    check("GPS", hal::gps_init());
+    check("Radio", hal::radio_init());
+    check("Storage", hal::storage_init());
+    check("Battery", hal::battery_init());
 
     // Phase 2: Load or generate identity
     if (!crypto::identity_load(device_identity, "/identity.key")) {
         Serial.println("Generating new identity...");
         crypto::identity_generate(device_identity);
-        crypto::identity_save(device_identity, "/identity.key");
+        if (!crypto::identity_save(device_identity, "/identity.key")) {
+            Serial.println("[BOOT] WARNING: Failed to save identity to SD");
+        }
     }
 
     // Phase 3: Initialize networking
-    net::transport_init();
+    if (!net::transport_init()) {
+        Serial.println("[BOOT] WARNING: Transport init failed");
+    }
 
     // Phase 5-6: Initialize app and UI
     app::waypoint_db_init("/waypoints.db");
     app::peers_init();
     ui::ui_init();
     ui::ui_show(ui::SCREEN_MAIN);
-
-    // Announce ourselves on the network
-    // net::Destination dest;
-    // net::destination_derive(device_identity, "lxmf", "delivery", dest);
-    // net::announce_send(device_identity, dest);
 
     Serial.println("Ready.");
 }
@@ -77,7 +91,7 @@ void loop() {
     net::transport_poll();
 
     // Update GPS
-    // hal::gps_poll();
+    hal::gps_poll();
 
     // Update UI
     ui::ui_update();

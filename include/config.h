@@ -35,7 +35,7 @@
 #define RADIO_TX_POWER_DBM  7     // Conservative default, max 22
 #define RADIO_PREAMBLE_LEN  8
 #define RADIO_TCXO_VOLTAGE  1.8f    // DIO3 TCXO reference voltage
-#define RADIO_SYNC_WORD     0xAB
+#define RADIO_SYNC_WORD     0x12    // Reticulum LoRa sync word (must match Python RNS)
 #define RADIO_CURRENT_LIMIT 140.0f  // mA
 
 // --- GPS (UART) ---
