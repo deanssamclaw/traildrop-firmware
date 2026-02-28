@@ -18,6 +18,7 @@
 #include "crypto/hash.h"
 #include "crypto/identity.h"
 #include "crypto/encrypt.h"
+#include "crypto/token.h"
 #include <RNG.h>
 
 // Boot status display — shows init results on screen
@@ -27,44 +28,44 @@ static void show_boot_status(const char* module, bool ok, int line) {
 }
 
 // ============================================================
-// Phase 2: Crypto Self-Tests
+// Phase 2: Crypto Self-Tests (Reticulum-compatible)
 // ============================================================
 
 static bool test_sha256() {
-    // Test vector: SHA-256("abc") = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+    // Test vector: SHA-256("abc") = ba7816bf...
     const uint8_t test_data[] = "abc";
     uint8_t hash[32];
     crypto::sha256(test_data, 3, hash);
-    
+
     const uint8_t expected[32] = {
         0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea,
         0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
         0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c,
         0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad
     };
-    
+
     return memcmp(hash, expected, 32) == 0;
 }
 
 static bool test_hmac_sha256() {
-    // Test vector: HMAC-SHA256(key="key", data="The quick brown fox jumps over the lazy dog")
+    // Test vector: HMAC-SHA256(key="key", data="The quick brown fox...")
     const uint8_t key[] = "key";
     const uint8_t data[] = "The quick brown fox jumps over the lazy dog";
     uint8_t hmac[32];
     crypto::hmac_sha256(key, 3, data, 44, hmac);
-    
+
     const uint8_t expected[32] = {
         0xf7, 0xbc, 0x83, 0xf4, 0x30, 0x53, 0x84, 0x24,
         0xb1, 0x32, 0x98, 0xe6, 0xaa, 0x6f, 0xb1, 0x43,
         0xef, 0x4d, 0x59, 0xa1, 0x49, 0x46, 0x17, 0x59,
         0x97, 0x47, 0x9d, 0xbc, 0x2d, 0x1a, 0x3c, 0xd8
     };
-    
+
     return memcmp(hmac, expected, 32) == 0;
 }
 
 static bool test_aes256_cbc() {
-    // Test AES-256-CBC encrypt/decrypt roundtrip
+    // AES-256-CBC encrypt/decrypt roundtrip
     const uint8_t key[32] = {
         0x60, 0x3d, 0xeb, 0x10, 0x15, 0xca, 0x71, 0xbe,
         0x2b, 0x73, 0xae, 0xf0, 0x85, 0x7d, 0x77, 0x81,
@@ -77,173 +78,302 @@ static bool test_aes256_cbc() {
     };
     const uint8_t plaintext[] = "Hello, TrailDrop! This is a test message.";
     size_t plaintext_len = strlen((const char*)plaintext);
-    
+
     uint8_t ciphertext[128];
     size_t cipher_len = 0;
     if (!crypto::aes256_cbc_encrypt(key, iv, plaintext, plaintext_len, ciphertext, &cipher_len)) {
         return false;
     }
-    
+
     uint8_t decrypted[128];
     size_t decrypted_len = 0;
     if (!crypto::aes256_cbc_decrypt(key, iv, ciphertext, cipher_len, decrypted, &decrypted_len)) {
         return false;
     }
-    
+
     return (decrypted_len == plaintext_len) && (memcmp(plaintext, decrypted, plaintext_len) == 0);
 }
 
-static bool test_identity() {
-    // Generate identity
+static bool test_hkdf() {
+    // RFC 5869 Test Case 1
+    const uint8_t ikm[22] = {
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b,
+        0x0b, 0x0b, 0x0b, 0x0b, 0x0b, 0x0b
+    };
+    const uint8_t salt[13] = {
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c
+    };
+    const uint8_t info[10] = {
+        0xf0, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7,
+        0xf8, 0xf9
+    };
+    const uint8_t expected_okm[42] = {
+        0x3c, 0xb2, 0x5f, 0x25, 0xfa, 0xac, 0xd5, 0x7a,
+        0x90, 0x43, 0x4f, 0x64, 0xd0, 0x36, 0x2f, 0x2a,
+        0x2d, 0x2d, 0x0a, 0x90, 0xcf, 0x1a, 0x5a, 0x4c,
+        0x5d, 0xb0, 0x2d, 0x56, 0xec, 0xc4, 0xc5, 0xbf,
+        0x34, 0x00, 0x72, 0x08, 0xd5, 0xb8, 0x87, 0x18,
+        0x58, 0x65
+    };
+
+    uint8_t okm[42];
+    crypto::hkdf_sha256(ikm, 22, salt, 13, info, 10, okm, 42);
+
+    return memcmp(okm, expected_okm, 42) == 0;
+}
+
+static bool test_token_roundtrip() {
+    // Token encrypt then decrypt with known key
+    uint8_t derived_key[64];
+    for (int i = 0; i < 64; i++) derived_key[i] = (uint8_t)i;
+
+    crypto::Token token;
+    crypto::token_init(token, derived_key);
+
+    const uint8_t plaintext[] = "Token roundtrip test message";
+    size_t plaintext_len = strlen((const char*)plaintext);
+
+    uint8_t encrypted[256];
+    size_t enc_len = 0;
+    if (!crypto::token_encrypt(token, plaintext, plaintext_len, encrypted, &enc_len)) {
+        return false;
+    }
+
+    uint8_t decrypted[256];
+    size_t dec_len = 0;
+    if (!crypto::token_decrypt(token, encrypted, enc_len, decrypted, &dec_len)) {
+        return false;
+    }
+
+    return (dec_len == plaintext_len) && (memcmp(plaintext, decrypted, plaintext_len) == 0);
+}
+
+static bool test_token_hmac_reject() {
+    // Corrupt one byte of token, verify decrypt fails
+    uint8_t derived_key[64];
+    for (int i = 0; i < 64; i++) derived_key[i] = (uint8_t)(i + 100);
+
+    crypto::Token token;
+    crypto::token_init(token, derived_key);
+
+    const uint8_t plaintext[] = "HMAC rejection test";
+    size_t plaintext_len = strlen((const char*)plaintext);
+
+    uint8_t encrypted[256];
+    size_t enc_len = 0;
+    if (!crypto::token_encrypt(token, plaintext, plaintext_len, encrypted, &enc_len)) {
+        return false;
+    }
+
+    // Corrupt a byte in the ciphertext area (after IV, before HMAC)
+    encrypted[20] ^= 0xFF;
+
+    uint8_t decrypted[256];
+    size_t dec_len = 0;
+    // Should fail HMAC verification
+    if (crypto::token_decrypt(token, encrypted, enc_len, decrypted, &dec_len)) {
+        return false; // Should have failed
+    }
+
+    return true;
+}
+
+static bool test_identity_save_load() {
+    // Generate, save, load, verify all fields including hash
     crypto::Identity id;
     if (!crypto::identity_generate(id)) {
         return false;
     }
-    
-    // Save to SD card
+
     const char* test_path = "/identity_test.dat";
     if (!crypto::identity_save(id, test_path)) {
         return false;
     }
-    
-    // Load back
+
     crypto::Identity loaded;
     if (!crypto::identity_load(loaded, test_path)) {
         return false;
     }
-    
-    // Verify match (ed25519_private is now 32 bytes, not 64)
+
     bool match = (memcmp(id.x25519_public, loaded.x25519_public, 32) == 0) &&
                  (memcmp(id.x25519_private, loaded.x25519_private, 32) == 0) &&
                  (memcmp(id.ed25519_public, loaded.ed25519_public, 32) == 0) &&
-                 (memcmp(id.ed25519_private, loaded.ed25519_private, 32) == 0);
-    
-    // Clean up
+                 (memcmp(id.ed25519_private, loaded.ed25519_private, 32) == 0) &&
+                 (memcmp(id.hash, loaded.hash, 16) == 0);
+
     hal::storage_remove(test_path);
-    
     return match;
 }
 
-static bool test_ecdh() {
-    // Generate two identities and perform ECDH key exchange
+static bool test_identity_hash() {
+    // Verify identity hash = truncated_sha256(x25519_pub + ed25519_pub)
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) {
+        return false;
+    }
+
+    // Manually compute expected hash with correct key order
+    uint8_t pub_concat[64];
+    memcpy(pub_concat, id.x25519_public, 32);       // X25519 FIRST
+    memcpy(pub_concat + 32, id.ed25519_public, 32);  // Ed25519 SECOND
+    uint8_t full_hash[32];
+    crypto::sha256(pub_concat, 64, full_hash);
+
+    // Compare first 16 bytes with stored hash
+    return memcmp(id.hash, full_hash, 16) == 0;
+}
+
+static bool test_destination_hash() {
+    // Verify two-step destination hash process
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) {
+        return false;
+    }
+
+    // Compute manually: step 1 — name_hash = sha256("traildrop.waypoint")[0:10]
+    uint8_t name_full_hash[32];
+    const char* full_name = "traildrop.waypoint";
+    crypto::sha256((const uint8_t*)full_name, strlen(full_name), name_full_hash);
+
+    // Step 2 — concat name_hash(10) + identity.hash(16) = 26 bytes
+    uint8_t concat[26];
+    memcpy(concat, name_full_hash, 10);
+    memcpy(concat + 10, id.hash, 16);
+
+    // Step 3 — dest_hash = sha256(concat)[0:16]
+    uint8_t expected[32];
+    crypto::sha256(concat, 26, expected);
+
+    // Compare with function output
+    uint8_t actual[16];
+    crypto::identity_destination_hash("traildrop.waypoint", id, actual);
+
+    if (memcmp(actual, expected, 16) != 0) {
+        return false;
+    }
+
+    // Different name should produce different hash
+    uint8_t other[16];
+    crypto::identity_destination_hash("traildrop.chat", id, other);
+    return memcmp(actual, other, 16) != 0;
+}
+
+static bool test_identity_encrypt_decrypt() {
+    // Alice encrypts for Bob, Bob decrypts
     crypto::Identity alice, bob;
     if (!crypto::identity_generate(alice) || !crypto::identity_generate(bob)) {
         return false;
     }
-    
-    // Alice derives shared secret using Bob's public key
-    uint8_t shared_alice[32];
-    if (!crypto::identity_derive_shared_key(bob.x25519_public, alice.x25519_private, shared_alice)) {
+
+    const uint8_t plaintext[] = "Hello Bob, this is Alice!";
+    size_t plaintext_len = strlen((const char*)plaintext);
+
+    uint8_t encrypted[256];
+    size_t enc_len = 0;
+    if (!crypto::identity_encrypt(bob, plaintext, plaintext_len, encrypted, &enc_len)) {
         return false;
     }
-    
-    // Bob derives shared secret using Alice's public key
-    uint8_t shared_bob[32];
-    if (!crypto::identity_derive_shared_key(alice.x25519_public, bob.x25519_private, shared_bob)) {
+
+    // Verify output has expected overhead
+    if (enc_len < 32 + TOKEN_OVERHEAD + plaintext_len) {
         return false;
     }
-    
-    // Both should match
-    return memcmp(shared_alice, shared_bob, 32) == 0;
+
+    uint8_t decrypted[256];
+    size_t dec_len = 0;
+    if (!crypto::identity_decrypt(bob, encrypted, enc_len, decrypted, &dec_len)) {
+        return false;
+    }
+
+    return (dec_len == plaintext_len) && (memcmp(plaintext, decrypted, plaintext_len) == 0);
+}
+
+static bool test_cross_identity_failure() {
+    // Alice encrypts for Bob, Carol can't decrypt
+    crypto::Identity alice, bob, carol;
+    if (!crypto::identity_generate(alice) || !crypto::identity_generate(bob) ||
+        !crypto::identity_generate(carol)) {
+        return false;
+    }
+
+    const uint8_t plaintext[] = "Secret for Bob only";
+    size_t plaintext_len = strlen((const char*)plaintext);
+
+    uint8_t encrypted[256];
+    size_t enc_len = 0;
+    if (!crypto::identity_encrypt(bob, plaintext, plaintext_len, encrypted, &enc_len)) {
+        return false;
+    }
+
+    // Carol tries to decrypt — should fail
+    uint8_t decrypted[256];
+    size_t dec_len = 0;
+    if (crypto::identity_decrypt(carol, encrypted, enc_len, decrypted, &dec_len)) {
+        return false; // Should have failed
+    }
+
+    return true;
 }
 
 static bool test_ed25519_sign_verify() {
-    // Generate identity and test signing/verification
     crypto::Identity id;
     if (!crypto::identity_generate(id)) {
         return false;
     }
-    
+
     const uint8_t message[] = "Test message for signing";
     uint8_t signature[64];
-    
-    // Sign
+
     if (!crypto::identity_sign(id, message, sizeof(message), signature)) {
         return false;
     }
-    
+
     // Verify with correct public key
     if (!crypto::identity_verify(id.ed25519_public, message, sizeof(message), signature)) {
         return false;
     }
-    
+
     // Verify that wrong public key fails
     crypto::Identity wrong_id;
     crypto::identity_generate(wrong_id);
     if (crypto::identity_verify(wrong_id.ed25519_public, message, sizeof(message), signature)) {
-        return false; // Should have failed verification
+        return false;
     }
-    
-    return true;
-}
 
-static bool test_destination_hash() {
-    // Test destination hash derivation
-    crypto::Identity id;
-    if (!crypto::identity_generate(id)) {
-        return false;
-    }
-    
-    uint8_t hash1[16];
-    uint8_t hash2[16];
-    
-    // Same identity and aspects should produce same hash
-    crypto::identity_destination_hash(id, "traildrop", "waypoints", hash1);
-    crypto::identity_destination_hash(id, "traildrop", "waypoints", hash2);
-    
-    if (memcmp(hash1, hash2, 16) != 0) {
-        return false;
-    }
-    
-    // Different aspects should produce different hash
-    uint8_t hash3[16];
-    crypto::identity_destination_hash(id, "traildrop", "chat", hash3);
-    
-    return memcmp(hash1, hash3, 16) != 0;
+    return true;
 }
 
 static void run_crypto_tests(int& line) {
     Serial.println("\n[CRYPTO] Running Phase 2 crypto tests...");
     hal::display_printf(0, line * 18, 0xFFFF, 2, "=== Crypto Tests ===");
     line++;
-    
-    // Test 1: SHA-256
-    bool sha_ok = test_sha256();
-    Serial.printf("[CRYPTO] SHA-256:        %s\n", sha_ok ? "PASS" : "FAIL");
-    show_boot_status("SHA-256", sha_ok, line++);
-    
-    // Test 2: HMAC-SHA256
-    bool hmac_ok = test_hmac_sha256();
-    Serial.printf("[CRYPTO] HMAC-SHA256:    %s\n", hmac_ok ? "PASS" : "FAIL");
-    show_boot_status("HMAC-SHA256", hmac_ok, line++);
-    
-    // Test 3: AES-256-CBC
-    bool aes_ok = test_aes256_cbc();
-    Serial.printf("[CRYPTO] AES-256-CBC:    %s\n", aes_ok ? "PASS" : "FAIL");
-    show_boot_status("AES-256-CBC", aes_ok, line++);
-    
-    // Test 4: Identity save/load
-    bool id_ok = test_identity();
-    Serial.printf("[CRYPTO] Identity:       %s\n", id_ok ? "PASS" : "FAIL");
-    show_boot_status("Identity", id_ok, line++);
-    
-    // Test 5: X25519 ECDH
-    bool ecdh_ok = test_ecdh();
-    Serial.printf("[CRYPTO] X25519 ECDH:    %s\n", ecdh_ok ? "PASS" : "FAIL");
-    show_boot_status("X25519 ECDH", ecdh_ok, line++);
-    
-    // Test 6: Ed25519 sign/verify
-    bool sign_ok = test_ed25519_sign_verify();
-    Serial.printf("[CRYPTO] Ed25519 Sign:   %s\n", sign_ok ? "PASS" : "FAIL");
-    show_boot_status("Ed25519 Sign", sign_ok, line++);
-    
-    // Test 7: Destination hash
-    bool dest_ok = test_destination_hash();
-    Serial.printf("[CRYPTO] Dest Hash:      %s\n", dest_ok ? "PASS" : "FAIL");
-    show_boot_status("Dest Hash", dest_ok, line++);
-    
-    // Summary
-    bool all_pass = sha_ok && hmac_ok && aes_ok && id_ok && ecdh_ok && sign_ok && dest_ok;
+
+    struct { const char* name; bool (*fn)(); } tests[] = {
+        {"SHA-256",         test_sha256},
+        {"HMAC-SHA256",     test_hmac_sha256},
+        {"AES-256-CBC",     test_aes256_cbc},
+        {"HKDF-SHA256",     test_hkdf},
+        {"Token Round",     test_token_roundtrip},
+        {"Token HMAC",      test_token_hmac_reject},
+        {"Identity S/L",    test_identity_save_load},
+        {"Identity Hash",   test_identity_hash},
+        {"Dest Hash",       test_destination_hash},
+        {"Encrypt/Decrypt", test_identity_encrypt_decrypt},
+        {"Cross-ID Fail",   test_cross_identity_failure},
+        {"Ed25519 Sign",    test_ed25519_sign_verify},
+    };
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+
+    bool all_pass = true;
+    for (int i = 0; i < num_tests; i++) {
+        bool ok = tests[i].fn();
+        if (!ok) all_pass = false;
+        Serial.printf("[CRYPTO] %-16s %s\n", tests[i].name, ok ? "PASS" : "FAIL");
+        show_boot_status(tests[i].name, ok, line++);
+    }
+
     Serial.printf("[CRYPTO] === %s ===\n", all_pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
     hal::display_printf(0, (line + 1) * 18, all_pass ? 0x07E0 : 0xF800, 2,
                         all_pass ? "Crypto: ALL PASS" : "Crypto: FAILURES");

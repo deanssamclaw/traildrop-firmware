@@ -1,5 +1,6 @@
 #include "hash.h"
 #include <SHA256.h>
+#include <HKDF.h>
 #include <string.h>
 
 namespace crypto {
@@ -18,6 +19,15 @@ void hmac_sha256(const uint8_t* key, size_t key_len,
     sha.resetHMAC(key, key_len);
     sha.update(data, data_len);
     sha.finalizeHMAC(key, key_len, out, 32);
+}
+
+void hkdf_sha256(const uint8_t* ikm, size_t ikm_len,
+                 const uint8_t* salt, size_t salt_len,
+                 const uint8_t* info, size_t info_len,
+                 uint8_t* out, size_t out_len) {
+    HKDF<SHA256> hkdf;
+    hkdf.setKey(ikm, ikm_len, salt, salt_len);
+    hkdf.extract(out, out_len, info, info_len);
 }
 
 } // namespace crypto

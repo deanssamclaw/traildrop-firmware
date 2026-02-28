@@ -91,6 +91,9 @@
 #define RNS_MTU             500   // Reticulum max transmission unit
 #define IDENTITY_KEY_SIZE   32    // X25519 key size
 #define DEST_HASH_SIZE      16    // Truncated SHA-256 destination hash
+#define NAME_HASH_LENGTH    10    // Truncated name hash (80 bits / 8)
+#define TOKEN_OVERHEAD      48    // IV(16) + HMAC(32)
+#define DERIVED_KEY_LENGTH  64    // HKDF output for Token (signing + encryption)
 #define ANNOUNCE_INTERVAL   300   // Seconds between announces (5 min)
 
 // ============================================================
