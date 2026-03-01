@@ -42,4 +42,7 @@ int peer_count();
 // Get first valid peer (for testing). Returns nullptr if no peers.
 const Peer* peer_first();
 
+// Look up peer by lxmf_dest_hash (for LXMF source verification)
+const Peer* peer_lookup_by_lxmf_dest(const uint8_t lxmf_dest[DEST_HASH_SIZE]);
+
 } // namespace net

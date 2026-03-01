@@ -28,6 +28,7 @@
 #include "net/transport.h"
 #include "msg/msgpack.h"
 #include "msg/lxmf.h"
+#include "msg/lxmf_transport.h"
 #include <RNG.h>
 
 // Device identity (global, used by networking later)
@@ -1696,6 +1697,21 @@ static void run_msgpack_lxmf_tests(int& line) {
 }
 
 // ============================================================
+// LXMF receive callback (used in setup/loop)
+// ============================================================
+
+static void on_lxmf_received(const msg::LXMessage& msg, int rssi, float snr) {
+    Serial.printf("[LXMF] Received message!\n");
+    Serial.printf("[LXMF] Title: %.*s\n", (int)msg.title_len, msg.title);
+    Serial.printf("[LXMF] Content: %.*s\n", (int)msg.content_len, msg.content);
+    Serial.printf("[LXMF] Signature valid: %s\n", msg.signature_valid ? "YES" : "NO");
+    if (msg.has_custom_fields) {
+        Serial.printf("[LXMF] Custom type: %.*s\n", (int)msg.custom_type_len, msg.custom_type);
+    }
+    Serial.printf("[LXMF] RSSI=%d SNR=%.1f\n", rssi, snr);
+}
+
+// ============================================================
 // Phase 4a.5: Announce Migration + Dual Destination Tests
 // ============================================================
 
@@ -1996,6 +2012,239 @@ static void run_phase4a5_tests(int& line) {
     line += 2;
 }
 
+// ============================================================
+// Phase 4b: LXMF Transport Tests
+// ============================================================
+
+static bool test_lxmf_send_receive_roundtrip() {
+    // Full cycle: build LXMF, encrypt for peer, decrypt as peer, parse, verify
+    crypto::Identity alice, bob;
+    if (!crypto::identity_generate(alice)) return false;
+    if (!crypto::identity_generate(bob)) return false;
+
+    net::Destination alice_lxmf, bob_lxmf;
+    if (!net::destination_derive(alice, "lxmf", "delivery", alice_lxmf)) return false;
+    if (!net::destination_derive(bob, "lxmf", "delivery", bob_lxmf)) return false;
+
+    // Build LXMF message from alice to bob
+    uint8_t lxmf_out[500];
+    size_t lxmf_len = sizeof(lxmf_out);
+    uint8_t message_hash[32];
+
+    if (!msg::lxmf_build(
+            alice, alice_lxmf.hash, bob_lxmf.hash,
+            12345.0,
+            (const uint8_t*)"Test", 4,
+            (const uint8_t*)"Hello Bob!", 10,
+            (const uint8_t*)"traildrop/waypoint", 18,
+            nullptr, 0,
+            lxmf_out, &lxmf_len, message_hash)) {
+        Serial.println("[4B] LXMF build failed");
+        return false;
+    }
+
+    // Encrypt for bob
+    crypto::Identity bob_pub;
+    memcpy(bob_pub.x25519_public, bob.x25519_public, 32);
+    memcpy(bob_pub.ed25519_public, bob.ed25519_public, 32);
+    memcpy(bob_pub.hash, bob.hash, 16);
+    memset(bob_pub.x25519_private, 0, 32);
+    memset(bob_pub.ed25519_private, 0, 32);
+    bob_pub.valid = true;
+
+    uint8_t encrypted[RNS_MTU];
+    size_t enc_len = 0;
+    if (!crypto::identity_encrypt(bob_pub, lxmf_out, lxmf_len, encrypted, &enc_len)) {
+        Serial.println("[4B] Encrypt failed");
+        return false;
+    }
+
+    // Decrypt as bob
+    uint8_t decrypted[RNS_MTU];
+    size_t dec_len = 0;
+    if (!crypto::identity_decrypt(bob, encrypted, enc_len, decrypted, &dec_len)) {
+        Serial.println("[4B] Decrypt failed");
+        return false;
+    }
+
+    // Verify decrypted matches original
+    if (dec_len != lxmf_len || memcmp(decrypted, lxmf_out, lxmf_len) != 0) {
+        Serial.println("[4B] Decrypt content mismatch");
+        return false;
+    }
+
+    // Reconstruct full LXMF: prepend bob's dest hash
+    uint8_t full_lxmf[600];
+    memcpy(full_lxmf, bob_lxmf.hash, 16);
+    memcpy(full_lxmf + 16, decrypted, dec_len);
+
+    // Parse
+    msg::LXMessage msg;
+    if (!msg::lxmf_parse(full_lxmf, 16 + dec_len, msg)) {
+        Serial.println("[4B] Parse failed");
+        return false;
+    }
+
+    // Verify fields
+    if (msg.title_len != 4 || memcmp(msg.title, "Test", 4) != 0) return false;
+    if (msg.content_len != 10 || memcmp(msg.content, "Hello Bob!", 10) != 0) return false;
+    if (!msg.has_custom_fields) return false;
+    if (msg.custom_type_len != 18 || memcmp(msg.custom_type, "traildrop/waypoint", 18) != 0) return false;
+
+    // Verify signature with alice's public key
+    if (!msg::lxmf_verify(msg, alice.ed25519_public)) {
+        Serial.println("[4B] Signature verification failed");
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_lxmf_dedup() {
+    // Clear dedup state by re-initing
+    msg::lxmf_transport_init(device_identity, device_destination, device_lxmf_destination);
+
+    uint8_t hash[32];
+    for (int i = 0; i < 32; i++) hash[i] = (uint8_t)(i + 0x50);
+
+    // First time: not duplicate
+    if (msg::lxmf_is_duplicate(hash)) return false;
+    msg::lxmf_record_message(hash);
+
+    // Second time: is duplicate
+    if (!msg::lxmf_is_duplicate(hash)) return false;
+
+    // Different hash: not duplicate
+    uint8_t hash2[32];
+    for (int i = 0; i < 32; i++) hash2[i] = (uint8_t)(i + 0xA0);
+    if (msg::lxmf_is_duplicate(hash2)) return false;
+
+    return true;
+}
+
+static bool test_peer_lookup_by_lxmf_dest_fn() {
+    net::peer_table_init();
+
+    uint8_t dest[DEST_HASH_SIZE];
+    uint8_t lxmf_dest[DEST_HASH_SIZE];
+    uint8_t x25519[32];
+    uint8_t ed25519[32];
+    uint8_t id_hash[DEST_HASH_SIZE];
+
+    for (int i = 0; i < DEST_HASH_SIZE; i++) dest[i] = (uint8_t)(i + 0x10);
+    for (int i = 0; i < DEST_HASH_SIZE; i++) lxmf_dest[i] = (uint8_t)(i + 0x20);
+    for (int i = 0; i < 32; i++) x25519[i] = (uint8_t)(i + 0x30);
+    for (int i = 0; i < 32; i++) ed25519[i] = (uint8_t)(i + 0x40);
+    for (int i = 0; i < DEST_HASH_SIZE; i++) id_hash[i] = (uint8_t)(i + 0x50);
+
+    if (!net::peer_store(dest, x25519, ed25519, id_hash, "LxmfPeer", lxmf_dest)) return false;
+
+    // Lookup by lxmf_dest should find the peer
+    const net::Peer* peer = net::peer_lookup_by_lxmf_dest(lxmf_dest);
+    if (peer == nullptr) return false;
+    if (strcmp(peer->app_data, "LxmfPeer") != 0) return false;
+
+    // Wrong lxmf dest should return nullptr
+    uint8_t wrong[DEST_HASH_SIZE];
+    memset(wrong, 0xFF, DEST_HASH_SIZE);
+    if (net::peer_lookup_by_lxmf_dest(wrong) != nullptr) return false;
+
+    // Lookup by regular dest should still work
+    const net::Peer* peer2 = net::peer_lookup(dest);
+    if (peer2 == nullptr) return false;
+
+    return true;
+}
+
+static bool test_lxmf_receive_craft() {
+    // Craft a known LXMF packet, decrypt/parse manually (simulates receive)
+    crypto::Identity sender, receiver;
+    if (!crypto::identity_generate(sender)) return false;
+    if (!crypto::identity_generate(receiver)) return false;
+
+    net::Destination sender_lxmf, receiver_lxmf;
+    if (!net::destination_derive(sender, "lxmf", "delivery", sender_lxmf)) return false;
+    if (!net::destination_derive(receiver, "lxmf", "delivery", receiver_lxmf)) return false;
+
+    // Build LXMF
+    uint8_t lxmf_out[500];
+    size_t lxmf_len = sizeof(lxmf_out);
+    uint8_t msg_hash[32];
+
+    if (!msg::lxmf_build(
+            sender, sender_lxmf.hash, receiver_lxmf.hash,
+            99999.0,
+            (const uint8_t*)"Alert", 5,
+            (const uint8_t*)"Emergency test", 14,
+            nullptr, 0, nullptr, 0,
+            lxmf_out, &lxmf_len, msg_hash)) {
+        return false;
+    }
+
+    // Encrypt for receiver
+    crypto::Identity receiver_pub;
+    memcpy(receiver_pub.x25519_public, receiver.x25519_public, 32);
+    memcpy(receiver_pub.hash, receiver.hash, 16);
+    receiver_pub.valid = true;
+
+    uint8_t encrypted[RNS_MTU];
+    size_t enc_len = 0;
+    if (!crypto::identity_encrypt(receiver_pub, lxmf_out, lxmf_len, encrypted, &enc_len)) {
+        return false;
+    }
+
+    // Decrypt as receiver
+    uint8_t decrypted[RNS_MTU];
+    size_t dec_len = 0;
+    if (!crypto::identity_decrypt(receiver, encrypted, enc_len, decrypted, &dec_len)) {
+        return false;
+    }
+
+    // Reconstruct full LXMF
+    uint8_t full_lxmf[600];
+    memcpy(full_lxmf, receiver_lxmf.hash, 16);
+    memcpy(full_lxmf + 16, decrypted, dec_len);
+
+    msg::LXMessage msg;
+    if (!msg::lxmf_parse(full_lxmf, 16 + dec_len, msg)) return false;
+
+    if (msg.title_len != 5 || memcmp(msg.title, "Alert", 5) != 0) return false;
+    if (msg.content_len != 14 || memcmp(msg.content, "Emergency test", 14) != 0) return false;
+    if (memcmp(msg.message_hash, msg_hash, 32) != 0) return false;
+
+    // Verify signature
+    if (!msg::lxmf_verify(msg, sender.ed25519_public)) return false;
+
+    return true;
+}
+
+static void run_phase4b_tests(int& line) {
+    Serial.println("\n[PHASE4B] Running Phase 4b LXMF transport tests...");
+    hal::display_printf(0, line * 18, 0xFFFF, 2, "=== 4b Tests ===");
+    line++;
+
+    struct { const char* name; bool (*fn)(); } tests[] = {
+        {"LXMF SendRecv",    test_lxmf_send_receive_roundtrip},
+        {"LXMF Dedup",       test_lxmf_dedup},
+        {"Peer LXMF Lkup",   test_peer_lookup_by_lxmf_dest_fn},
+        {"LXMF Craft RX",    test_lxmf_receive_craft},
+    };
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+
+    bool all_pass = true;
+    for (int i = 0; i < num_tests; i++) {
+        bool ok = tests[i].fn();
+        if (!ok) all_pass = false;
+        Serial.printf("[PHASE4B] %-16s %s\n", tests[i].name, ok ? "PASS" : "FAIL");
+        show_boot_status(tests[i].name, ok, line++);
+    }
+
+    Serial.printf("[PHASE4B] === %s ===\n", all_pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
+    hal::display_printf(0, (line + 1) * 18, all_pass ? 0x07E0 : 0xF800, 2,
+                        all_pass ? "4b: ALL PASS" : "4b: FAILURES");
+    line += 2;
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -2162,27 +2411,17 @@ void setup() {
         Serial.println("[BOOT] Network-degraded: missing radio or storage");
     }
 
-    // Phase 3d: Initialize transport layer
+    // Phase 3d: Initialize transport layer (needed for transport_announce)
     if (identity_ready && boot.radio) {
         net::transport_init(device_identity, device_destination);
-        
-        // Register data callback
-        net::transport_on_data([](const uint8_t* sender, const uint8_t* data, size_t len) {
-            Serial.printf("[DATA] Received %d bytes", len);
-            if (sender) {
-                Serial.printf(" from ");
-                for (int i = 0; i < 4; i++) Serial.printf("%02x", sender[i]);
-                Serial.printf("...");
-            } else {
-                Serial.printf(" (sender unknown)");
-            }
-            Serial.println();
-            Serial.printf("[DATA] Content: %.*s\n", (int)len, (const char*)data);
-        });
-        
+
+        // Phase 4b: Initialize LXMF transport (replaces transport_poll for receive)
+        msg::lxmf_transport_init(device_identity, device_destination, device_lxmf_destination);
+        msg::lxmf_set_receive_callback(on_lxmf_received);
+
         // Send initial announce
         net::transport_announce("TrailDrop");
-        Serial.println("[NET] Transport initialized, announce sent");
+        Serial.println("[NET] Transport initialized, LXMF transport ready, announce sent");
     }
 
     Serial.println("[BOOT] === Init complete ===\n");
@@ -2212,12 +2451,18 @@ void setup() {
         line++; // Add spacing
         run_phase4a5_tests(line);
 
+        // Phase 4b: Run LXMF transport tests
+        line++; // Add spacing
+        run_phase4b_tests(line);
+
         // Re-initialize after tests:
         // - Transport tests overwrite s_identity/s_destination with stack-local pointers
         // - Announce tests leave stale test peers in the peer table
         net::peer_table_init();
         if (identity_ready && boot.radio) {
             net::transport_init(device_identity, device_destination);
+            msg::lxmf_transport_init(device_identity, device_destination, device_lxmf_destination);
+            msg::lxmf_set_receive_callback(on_lxmf_received);
             // Re-announce after tests — boot announce was likely lost while
             // the other device was also running self-tests
             net::transport_announce("TrailDrop");
@@ -2245,17 +2490,23 @@ void loop() {
         
         // Test triggers
         if (key == 's' && identity_ready) {
-            // Send test message to first known peer
+            // Send LXMF message to first known peer
             const net::Peer* peer = net::peer_first();
             if (peer) {
-                const char* msg = "Hello from TrailDrop!";
-                Serial.printf("[TEST] Sending to peer %02x%02x%02x%02x...\n",
+                uint8_t msg_hash[32];
+                Serial.printf("[TEST] Sending LXMF to peer %02x%02x%02x%02x...\n",
                     peer->dest_hash[0], peer->dest_hash[1],
                     peer->dest_hash[2], peer->dest_hash[3]);
-                if (net::transport_send_data(peer->dest_hash, (const uint8_t*)msg, strlen(msg))) {
-                    Serial.println("[TEST] Message sent successfully");
+                if (msg::lxmf_send(
+                        device_identity, device_lxmf_destination.hash,
+                        peer->dest_hash,
+                        "Test", "Hello from TrailDrop!",
+                        (const uint8_t*)"traildrop/waypoint", 19,
+                        nullptr, 0,
+                        msg_hash)) {
+                    Serial.println("[TEST] LXMF message sent successfully");
                 } else {
-                    Serial.println("[TEST] Send failed");
+                    Serial.println("[TEST] LXMF send failed");
                 }
             } else {
                 Serial.println("[TEST] No peers discovered yet");
@@ -2293,34 +2544,40 @@ void loop() {
     // --- Periodic display update (every 1s) ---
     uint32_t now = millis();
 
-    // --- Network polling ---
+    // --- Network polling (Phase 4b: LXMF transport replaces raw transport_poll) ---
     if (identity_ready && boot.radio) {
         // Track peer count before poll to detect new peers
         static int prev_peer_count = 0;
         int before_peers = net::peer_count();
 
-        net::transport_poll();
+        msg::lxmf_transport_poll();
 
         // Auto-send: arm when we first discover a peer
         int after_peers = net::peer_count();
         if (after_peers > before_peers && !auto_send_pending) {
             auto_send_pending = true;
             auto_send_time = now + 30000;  // 30 seconds from now
-            Serial.printf("[AUTO] Peer discovered (count %d→%d), will send test message in 30s\n",
+            Serial.printf("[AUTO] Peer discovered (count %d→%d), will send LXMF in 30s\n",
                           before_peers, after_peers);
         }
         prev_peer_count = after_peers;
 
-        // Auto-send: fire when timer expires
+        // Auto-send: fire when timer expires — send LXMF instead of raw data
         if (auto_send_pending && now >= auto_send_time) {
             auto_send_pending = false;
             const net::Peer* peer = net::peer_first();
             if (peer) {
-                const char* msg = "Hello from TrailDrop!";
-                Serial.printf("[AUTO] Sending test message to peer %02x%02x%02x%02x...\n",
+                uint8_t msg_hash[32];
+                Serial.printf("[AUTO] Sending LXMF to peer %02x%02x%02x%02x...\n",
                     peer->dest_hash[0], peer->dest_hash[1],
                     peer->dest_hash[2], peer->dest_hash[3]);
-                net::transport_send_data(peer->dest_hash, (const uint8_t*)msg, strlen(msg));
+                msg::lxmf_send(
+                    device_identity, device_lxmf_destination.hash,
+                    peer->dest_hash,
+                    "Test", "Hello from TrailDrop!",
+                    (const uint8_t*)"traildrop/waypoint", 19,
+                    nullptr, 0,
+                    msg_hash);
             } else {
                 Serial.println("[AUTO] No peers available for auto-send");
             }
@@ -2343,7 +2600,7 @@ void loop() {
         if (identity_ready) {
             hal::display_printf(0, y_start - 72, 0x07FF, 1,
                 "Net: TX=%lu RX=%lu Peers=%d   ",
-                net::transport_tx_count(), net::transport_rx_count(),
+                net::transport_tx_count(), msg::lxmf_rx_count(),
                 net::peer_count());
         }
 

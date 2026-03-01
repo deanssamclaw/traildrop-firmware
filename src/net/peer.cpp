@@ -106,4 +106,14 @@ const Peer* peer_first() {
     return nullptr;
 }
 
+const Peer* peer_lookup_by_lxmf_dest(const uint8_t lxmf_dest[DEST_HASH_SIZE]) {
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peer_table[i].valid &&
+            memcmp(peer_table[i].lxmf_dest_hash, lxmf_dest, DEST_HASH_SIZE) == 0) {
+            return &peer_table[i];
+        }
+    }
+    return nullptr;
+}
+
 } // namespace net
