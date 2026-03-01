@@ -103,19 +103,19 @@ def main():
     )
 
     vectors["sender"] = {
-        "x25519_private": to_hex(sender.prv[:32]),
-        "x25519_public": to_hex(sender.pub[:32]),
-        "ed25519_private": to_hex(sender.prv[32:]),
-        "ed25519_public": to_hex(sender.pub[32:]),
+        "x25519_private": to_hex(sender.prv.private_bytes()),
+        "x25519_public": to_hex(sender.pub_bytes),
+        "ed25519_private": to_hex(sender.sig_prv.private_bytes()),
+        "ed25519_public": to_hex(sender.sig_pub.public_bytes()),
         "identity_hash": to_hex(sender.hash),
         "dest_hash": to_hex(sender_dest.hash),
     }
 
     vectors["receiver"] = {
-        "x25519_private": to_hex(receiver.prv[:32]),
-        "x25519_public": to_hex(receiver.pub[:32]),
-        "ed25519_private": to_hex(receiver.prv[32:]),
-        "ed25519_public": to_hex(receiver.pub[32:]),
+        "x25519_private": to_hex(receiver.prv.private_bytes()),
+        "x25519_public": to_hex(receiver.pub_bytes),
+        "ed25519_private": to_hex(receiver.sig_prv.private_bytes()),
+        "ed25519_public": to_hex(receiver.sig_pub.public_bytes()),
         "identity_hash": to_hex(receiver.hash),
         "dest_hash": to_hex(receiver_dest.hash),
     }
