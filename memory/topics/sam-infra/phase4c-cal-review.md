@@ -3,293 +3,241 @@
 Reviewed: 2026-03-01
 Commit: 7f175d7
 Files reviewed: `src/msg/waypoint.h`, `src/msg/waypoint.cpp`, `src/main_test.cpp`, `tests/phase4c_test_vectors.py`
-Cross-referenced: Phase 4b Cal review, `src/msg/msgpack.h`, `src/msg/msgpack.cpp`, `src/msg/lxmf.h`, `src/msg/lxmf.cpp`, `src/msg/lxmf_transport.cpp`
+Cross-referenced: Phase 4b Cal review, `src/msg/msgpack.h`, `src/msg/msgpack.cpp`, `src/msg/lxmf_transport.h`, `src/msg/lxmf_transport.cpp`, `src/msg/lxmf.h`, `src/hal/gps.h`
 
 ---
 
 ## 1. Buffer Overflows in waypoint_encode/decode
 
-### 1a. waypoint_encode string handling — SAFE
+### 1a. custom_data[256] in waypoint_send_explicit (waypoint.cpp:117) — SAFE
 
-`wp.name` is `char[32]`, `wp.notes` is `char[128]`. Both are written via `enc.write_str(wp.name, strlen(wp.name))`. The Encoder's `write_str` and underlying `write_bytes` check `pos + len > cap` before any `memcpy` (msgpack.cpp:18-19). If the encoded output exceeds the caller's buffer, `enc.error` is set and `waypoint_encode` returns 0 (waypoint.cpp:39). **No overflow.**
+The encode buffer is `uint8_t custom_data[256]`. Maximum encoded waypoint payload (name=31 chars, notes=127 chars, max uint32 timestamp) is **220 bytes** (verified with Python msgpack). 220 < 256. The Encoder sets `error=true` on overflow and `waypoint_encode` returns 0 (waypoint.cpp:39), so even if the estimate is wrong, no memory corruption occurs. **No issue.**
 
-**Potential concern**: `strlen(wp.name)` reads until null terminator. If the caller fails to null-terminate `wp.name` (e.g., fills all 32 bytes without null), `strlen` reads past the buffer. However, all call sites use `memset(&wp, 0, sizeof(wp))` + `strncpy` with `sizeof(wp.name) - 1`, ensuring null termination. **Safe in current usage**, but fragile if future callers skip `memset`.
+### 1b. Decoder key buffer: char key[16] (waypoint.cpp:57) — SAFE but fragile
 
-### 1b. waypoint_decode string handling — SAFE
+The decoder reads map keys into `char key[16]`, passing `sizeof(key) - 1 = 15` as max_len to `read_str`. All current keys are short ("lat"=3, "lon"=3, "ele"=3, "name"=4, "notes"=5, "ts"=2). If a future protocol version adds a key longer than 15 chars, `read_str` sets `error=true` and the decode fails entirely — no partial decode, no overflow. **Safe but unnecessarily restrictive.** Consider `char key[32]` for forward compatibility.
 
-```cpp
-size_t n = dec.read_str(wp.name, sizeof(wp.name) - 1);  // max_len = 31
-wp.name[n] = '\0';
-```
+### 1c. Decoder string field buffers — SAFE
 
-`read_str` (msgpack.cpp:252) checks `data_len > max_len` and sets error before copying. If the incoming string is 32+ bytes, decode returns false. The null terminator is written at index `n` (0-31), always within bounds. Same pattern for `wp.notes` with `sizeof(wp.notes) - 1 = 127`. **No overflow.**
+`wp.name` = 32 bytes, read with `sizeof(wp.name) - 1 = 31` max. `wp.notes` = 128 bytes, read with `sizeof(wp.notes) - 1 = 127` max. The msgpack `read_str` implementation **rejects** (sets error, returns 0) if the encoded string exceeds max_len — no truncation, no overflow. If a peer sends a name longer than 31 bytes, the entire waypoint decode fails. This is the right behavior for firmware.
 
-### 1c. waypoint_decode key buffer — SAFE
+### 1d. Encoder strlen safety — SAFE in current usage
 
-```cpp
-char key[16];
-size_t key_len = dec.read_str(key, sizeof(key) - 1);  // max_len = 15
-key[key_len] = '\0';
-```
-
-All known keys ("lat", "lon", "ele", "name", "notes", "ts") are <=5 chars. A malicious key >15 chars would trigger `read_str` error, returning false. **Safe.**
-
-### 1d. custom_data[256] in waypoint_send_explicit — SAFE
-
-```cpp
-uint8_t custom_data[256];
-size_t custom_data_len = waypoint_encode(wp, custom_data, sizeof(custom_data));
-```
-
-Maximum encoded waypoint size (computed below in section 4) is ~220 bytes. The 256-byte buffer has >35 bytes of headroom. **No overflow.**
+`waypoint_encode` calls `strlen(wp.name)` and `strlen(wp.notes)`. If a caller fails to null-terminate these fields, `strlen` reads past the buffer. However, all call sites use `memset(&wp, 0, sizeof(wp))` + `strncpy(field, src, sizeof(field) - 1)`, ensuring null termination. **Safe in current usage**, but fragile if future callers skip `memset`.
 
 ---
 
-## 2. Double Precision: lat/lon float64 Encoding — CORRECT
+## 2. Double Precision: lat/lon as float64
 
-### Write path (waypoint.cpp:19-22)
+### 2a. Encoder — CORRECT
 
-```cpp
-enc.write_float64(wp.lat);   // wp.lat is double
-enc.write_float64(wp.lon);   // wp.lon is double
+`waypoint_encode` calls `enc.write_float64(wp.lat)` and `enc.write_float64(wp.lon)`. Verified in `msgpack.cpp`: `write_float64` emits `0xcb` prefix + 8 bytes big-endian IEEE 754 double via `memcpy` from `double` to `uint64_t` + `write_be64`. **True float64 on the wire, no precision loss.**
+
+### 2b. Elevation encoded as float64 — INTENTIONAL but wasteful
+
+`enc.write_float64((double)wp.ele)` casts the `float ele` to double before encoding. This uses 9 bytes instead of 5 (float32 = `0xca` + 4 bytes). For elevation in meters, float32 gives ~7 significant digits — more than sufficient.
+
+**Impact**: 4 extra bytes per waypoint. At LoRa data rates this is meaningful (~32ms extra airtime at SF7/125kHz). Python `msgpack.packb` with `267.0` produces float64 by default, so this maintains byte-for-byte compatibility with the Python test vectors. The decision is defensible.
+
+### 2c. Decoder — CORRECT, handles both widths
+
+`dec.read_float64()` handles both `0xcb` (float64) and `0xca` (float32, promoted to double). Elevation is then narrowed: `wp.ele = (float)dec.read_float64()`. This means a future encoder could use float32 for elevation and the decoder would still work. **Forward-compatible.**
+
+### 2d. Python byte-for-byte verification — CONFIRMED
+
+The test `test_waypoint_encode_python_match` compares firmware output against the hex string generated by `phase4c_test_vectors.py`. Both the full-waypoint and no-notes vectors are verified with `memcmp`. **Encoding is interop-correct.**
+
+### 2e. GPS HAL types — CORRECT chain
+
+GPS HAL returns `double` for lat/lon and `float` for altitude (verified in `hal/gps.h`). Types match the Waypoint struct exactly:
 ```
-
-`write_float64` (msgpack.cpp:58-63) writes tag `0xcb` + 8-byte big-endian IEEE 754:
-
-```cpp
-void Encoder::write_float64(double val) {
-    write_byte(0xcb);
-    uint64_t bits;
-    memcpy(&bits, &val, sizeof(bits));
-    write_be64(bits);
-}
+gps_latitude()  → wp.lat  (double → double)  ✓ no precision loss
+gps_longitude() → wp.lon  (double → double)  ✓ no precision loss
+gps_altitude()  → wp.ele  (float → float)    ✓ no precision loss
 ```
-
-`memcpy` from `double` to `uint64_t` preserves exact IEEE 754 bits. `write_be64` serializes in network byte order. **True float64, no precision loss.**
-
-### Elevation encoding — CORRECT but wasteful
-
-```cpp
-enc.write_float64((double)wp.ele);  // wp.ele is float, cast to double
-```
-
-`wp.ele` is `float` (32-bit), cast to `double` before encoding. This preserves the float32 value exactly (double has a superset of float's representable values) and encodes it as float64 on the wire (9 bytes instead of 5 for float32).
-
-**Not a bug**, but wastes 4 bytes per waypoint. The Python test vector script also uses float64 for `ele`, so this is intentionally consistent. A future optimization could encode `ele` as float32 (`0xca` tag) to save 4 bytes, but this would require updating the Python test vectors.
-
-### Read path (waypoint.cpp:62)
-
-```cpp
-wp.ele = (float)dec.read_float64();
-```
-
-`read_float64` (msgpack.cpp:199-215) handles both `0xcb` (float64) and `0xca` (float32 promoted to double). The decode path correctly accepts either encoding. **Forward-compatible.**
 
 ---
 
-## 3. Msgpack Key Order: Python Interop — CORRECT
+## 3. The waypoint_send Flow
 
-### Firmware encoding order (waypoint.cpp:19-37)
+### 3a. GPS HAL → waypoint struct → msgpack — CORRECT
 
+`waypoint_send` (waypoint.cpp:84-98) checks `gps_has_fix()` first, refuses with clear message if no fix. Delegates to `waypoint_send_explicit` which:
+1. `memset(&wp, 0, sizeof(wp))` — zeroes all fields ✓
+2. Copies lat/lon/ele from parameters ✓
+3. `strncpy` for name/notes with null-termination guaranteed by memset ✓
+4. Calls `waypoint_encode` into `custom_data[256]` ✓
+5. Calls `lxmf_send` with custom_type="traildrop/waypoint" ✓
+
+### 3b. LXMF custom fields → encrypted transport — CORRECT but REDUNDANT
+
+`waypoint_send_explicit` passes:
+- `name` as LXMF **title**
+- `notes` as LXMF **content**
+- `"traildrop/waypoint"` as custom_type (18 bytes)
+- encoded waypoint (which also contains name and notes) as custom_data
+
+**The name and notes appear twice in the LXMF message** — once as human-readable title/content, once inside the msgpack custom_data. This provides a fallback for receivers that don't understand `traildrop/waypoint`, but doubles the text payload.
+
+For the typical case ("Waypoint" + "Shared from TrailDrop" = 29 chars duplicated), the redundancy adds ~30 bytes. Total LXMF = ~237 bytes, well within the 383-byte MDU. The design trades bandwidth for interop. **Acceptable, but this duplication is the primary reason long notes exceed the MDU limit (see section 5).**
+
+### 3c. Receive path (main_test.cpp:1713-1727) — CORRECT
+
+The `on_lxmf_received` callback correctly:
+1. Checks `has_custom_fields` and `custom_type == "traildrop/waypoint"` with both length check (==18) and `memcmp`
+2. Decodes waypoint from `custom_data` / `custom_data_len`
+3. Prints all fields on success, logs failure on decode error
+4. Falls through to regular LXMF display for non-waypoint messages
+
+### 3d. 's' key handler (main_test.cpp:2749-2758) — CORRECT
+
+Checks `gps_has_fix()` first, refuses with clear message. Looks up first peer, calls `waypoint_send`. **Phase 4b custom_type_len=19 bug resolved by design** — now delegates to `waypoint_send` which always uses 18.
+
+### 3e. **BUG: Timestamp is uptime, not Unix time (LOW-MEDIUM)**
+
+`waypoint_send_explicit` (waypoint.cpp:115):
+```cpp
+wp.timestamp = (uint32_t)(millis() / 1000);  // Uptime as placeholder
 ```
-lat -> lon -> ele -> name -> [notes] -> ts
-```
 
-### Python test vector order (phase4c_test_vectors.py:16-23)
+The struct comment says "Unix timestamp (seconds)" and test vectors use `1709312400` (a real Unix timestamp). But `millis() / 1000` gives seconds since boot, not epoch time. The comment says "placeholder," so this is presumably known.
 
-```python
-wp_full = {
-    "lat": 38.9717,
-    "lon": -95.2353,
-    "ele": 267.0,
-    "name": "Camp",
-    "notes": "Water source",
-    "ts": 1709312400,
-}
-```
+**Impact**: Receivers cannot meaningfully interpret the timestamp. Waypoints from different boots have overlapping timestamp values. The field name "ts" and Python test value imply Unix time to any interop partner.
 
-Python `dict` preserves insertion order (CPython 3.7+), and `msgpack.packb` serializes in insertion order. **Key order matches.**
-
-### Byte-for-byte verification
-
-The test `test_waypoint_encode_python_match` (main_test.cpp:2307-2342) hardcodes the expected hex from Python's `msgpack.packb` and does `memcmp`. This test **proves** byte-for-byte equivalence. If the test passes on hardware, the encoding is identical.
-
-### No-notes variant
-
-`test_waypoint_empty_notes` (main_test.cpp:2433-2471) separately verifies the 5-field variant (notes omitted) against a different Python-generated hex string. **Both variants verified.**
+**Recommendation**: Either (a) set `ts=0` to explicitly signal "no real time available," or (b) document in the protocol that ts is uptime until RTC/GPS-UTC is available. The current code silently produces a misleading value.
 
 ---
 
-## 4. Waypoint Size vs. 383-byte Encrypted MDU — SAFE
+## 4. Decoder Robustness
 
-### LXMF plaintext budget analysis
+### 4a. Truncated input — SAFE
 
-The encrypted MDU pre-check at lxmf_transport.cpp:102 rejects `lxmf_len > 383`. The LXMF plaintext structure from `lxmf_build` is:
+The Decoder tracks `pos` against `len`. Every `read_byte`/`read_bytes` checks bounds and sets `error=true` if insufficient data. The decode loop checks `if (dec.error) return false` after each field. A truncated message causes a clean failure. **No crash, no out-of-bounds read.**
 
+### 4b. Malformed map header — SAFE
+
+`read_map()` accepts fixmap (0x80-0x8f) and map16 (0xde). Any other tag sets `error=true`, returns 0. The `map_count < 4` check then rejects it. **No issue.**
+
+### 4c. Wrong value types — SAFE
+
+If a key "lat" has a string value instead of float64, `read_float64()` sees a non-0xcb/0xca tag, sets error. Loop exits. **Clean failure.**
+
+### 4d. Unknown keys — SAFE
+
+`dec.skip()` handles all msgpack types including nested maps/arrays (recursive). Verified in `msgpack.cpp` — covers fixint, fixmap, fixarray, fixstr, nil, bool, bin8/16/32, ext8/16/32, float32/64, uint8/16/32/64, int8/16/32/64, fixext, str8/16/32, array16/32, map16/32, negative fixint. **Comprehensive.** A waypoint from a newer firmware version with extra fields will decode successfully, ignoring the unknown fields. **Good design.**
+
+**Latent issue in skip()**: Several code paths use `pos += n` then check `if (pos > len)` afterward, rather than pre-checking. If `pos + n` wraps `size_t`, the post-check would miss the overflow. Also, recursive calls for nested containers have no depth limit — a deeply nested structure could overflow the stack. **Severity: VERY LOW** for waypoints — data comes from encrypted+signed LXMF (max 256 bytes of custom_data), so attacker-crafted input requires breaking the crypto first. But the skip() implementation is a latent hazard for any future use with untrusted input.
+
+### 4e. **Missing required-field validation — gap (LOW-MEDIUM)**
+
+After the decode loop, `wp.valid = true` is set unconditionally (waypoint.cpp:80). The only guard is `map_count < 4`, which is also too lenient — the minimum valid waypoint has 5 required fields (lat, lon, ele, name, ts), so the check should be `< 5`. A malformed message with 5 fields but none matching "lat", "lon", etc. would produce:
 ```
-source_hash(16) + signature(64) + packed_payload
-```
-
-So `packed_payload` must fit in `383 - 80 = 303 bytes`.
-
-### Packed payload structure
-
-```
-array(4) header:        1 byte
-timestamp (float64):    9 bytes
-title (bin8):          2 + title_len bytes
-content (bin8):        2 + content_len bytes
-fields map(2):         1 byte
-  FIELD_CUSTOM_TYPE:   1-2 bytes (uint8 0xFB = 2 bytes: 0xcc 0xfb)
-  custom_type (bin8):  2 + custom_type_len bytes
-  FIELD_CUSTOM_DATA:   1-2 bytes (uint8 0xFC = 2 bytes: 0xcc 0xfc)
-  custom_data (bin8):  2 + custom_data_len bytes
-```
-
-### Waypoint custom_data size calculation
-
-Full waypoint msgpack (6 fields with notes):
-
-```
-map(6):                1 byte (0x86)
-"lat" key:             1 + 3 = 4 bytes (fixstr)
-lat value:             1 + 8 = 9 bytes (float64)
-"lon" key:             1 + 3 = 4 bytes
-lon value:             1 + 8 = 9 bytes
-"ele" key:             1 + 3 = 4 bytes
-ele value:             1 + 8 = 9 bytes
-"name" key:            1 + 4 = 5 bytes
-name value:            1 + name_len bytes (fixstr, <=31 chars)
-"notes" key:           1 + 5 = 6 bytes
-notes value:           varies (fixstr <=31: 1+len, str8 32-127: 2+len)
-"ts" key:              1 + 2 = 3 bytes
-ts value:              5 bytes (uint32)
+wp.lat = 0.0, wp.lon = 0.0, wp.ele = 0.0, wp.name = "", wp.timestamp = 0, wp.valid = true
 ```
 
-**Minimum** (short name, no notes): `1 + 4+9 + 4+9 + 4+9 + 5+(1+1) + 3+5 = 55 bytes`
-**Typical** ("Camp" + "Water source"): `1 + 13 + 13 + 13 + 9 + 18 + 8 = 75 bytes`
-**Maximum** (name=31 chars, notes=127 chars): `1 + 13 + 13 + 13 + (5+1+31) + (6+2+127) + 8 = 220 bytes`
+This is a "valid" waypoint at Null Island (0°, 0°) in the Gulf of Guinea. Any consumer checking `wp.valid` would trust it.
 
-### Total LXMF plaintext at maximum waypoint
-
-With `waypoint_send_explicit` (waypoint.cpp:131-133):
-- title = name (<=31 chars, via `name ? name : "Waypoint"`)
-- content = notes (<=127 chars, via `notes ? notes : ""`)
-- custom_type = "traildrop/waypoint" (18 bytes)
-- custom_data = encoded waypoint (<=220 bytes)
-
-**Worst case packed_payload:**
-```
-1 + 9 + (2+31) + (2+127) + 1 + (2+2+18) + (2+2+220) = 419 bytes
+**Recommendation**: Track which required fields were actually populated:
+```cpp
+bool got_lat = false, got_lon = false;
+// ... in the loop: got_lat = true; etc.
+wp.valid = got_lat && got_lon;
 ```
 
-**Worst case LXMF plaintext (source_hash + signature + payload):**
-```
-16 + 64 + 419 = 499 bytes
-```
+At minimum, lat and lon should be required for `valid = true`.
 
-This exceeds the 383-byte MDU limit. `lxmf_send` would **correctly reject** this message at lxmf_transport.cpp:102. The message never reaches the encryption step. **The Phase 4b overflow fix catches this.**
+### 4f. Extremely large map_count — SAFE
 
-### Practical impact
+If a crafted message declares `map_count = 255` but only has 3 entries, the loop hits end of buffer, sets error, returns false. The `read_map` return type is `uint8_t` (max 255). For map16 with count > 255, it sets error. **No infinite loop, no allocation.**
+
+### 4g. Zero-length data — SAFE
+
+`waypoint_decode(data, 0, wp)`: `read_map` calls `read_byte` which sees `pos >= len` (0 >= 0), sets error. Returns false. **Clean.**
+
+---
+
+## 5. LXMF Size Budget with Waypoints
+
+### Max waypoint vs. 383-byte MDU — correctly rejected by Phase 4b pre-check
+
+With maximum-length fields (name=31, notes=127), the total LXMF message before encryption is **~497 bytes**, exceeding the 383-byte MDU by 114 bytes. The Phase 4b pre-check (`if (lxmf_len > 383) return false`) correctly prevents buffer overflow.
+
+General formula (name ≤ 31, notes > 31): `LXMF = 245 + 2 × notes_len` (name and notes appear twice due to duplication in section 3b).
 
 | Scenario | custom_data | packed_payload | LXMF total | Fits in 383? |
 |----------|-------------|---------------|------------|-------------|
-| Typical ("Camp", "Water source") | 75 | 150 | 230 | YES |
-| Medium name (15 chars), medium notes (50 chars) | ~120 | ~210 | ~290 | YES |
-| Max name (31), notes (80) | ~180 | ~330 | ~410 | **NO -- rejected** |
-| Max name (31), notes (50) | ~150 | ~280 | ~360 | YES -- tight |
-| Max name (31), no notes | ~60 | ~130 | ~210 | YES |
+| Typical ("Waypoint", "Shared from TrailDrop") | 90 | 160 | 240 | YES |
+| Medium name (15), notes (50) | 127 | 233 | 313 | YES |
+| Max name (31), notes (50) | 143 | 265 | 345 | YES |
+| Max name (31), notes (69) | 162 | 303 | 383 | YES — exact limit |
+| Max name (31), notes (70) | 163 | 305 | 385 | **NO — rejected** |
+| Max name (31), no notes | 85 | 157 | 237 | YES |
 
-**Conclusion**: With max name (31 chars) and notes > ~57 chars, the LXMF pre-check rejects. Typical waypoints (short name, medium notes) fit comfortably. The pre-check correctly prevents overflow. **No silent corruption possible.**
+(Verified with Python msgpack: `LXMF = 245 + 2 × notes_len` for max name.)
 
-### Recommendation (should-fix): User-facing size validation
+The boundary is: with max name (31 chars), notes ≤ 69 chars fits; notes ≥ 70 chars is rejected. The 2× factor from duplication (section 3b) is the primary reason — without it, notes could be ~169 chars (`LXMF = 214 + notes_len`).
 
-The rejection at lxmf_transport.cpp:102 is a deep, silent failure -- `waypoint_send_explicit` returns false, the caller sees `[LXMF-TX] ERROR` which doesn't explain why. Consider adding a pre-check in `waypoint_send_explicit` before calling `lxmf_send`:
+### **Missing failure log in waypoint_send_explicit (LOW)**
 
+When `lxmf_send` returns false (MDU exceeded), there's no log output from `waypoint_send_explicit` — only the deep `[LXMF-TX] ERROR` message. The function silently returns false. Add:
 ```cpp
-// Validate total will fit within encrypted MDU (~383 bytes)
-// Budget: 80 (src+sig) + 15 (array+ts+title/content headers) + title + content
-//       + 9 (fields map + field keys) + 4 (bin8 headers) + custom_type + custom_data
-size_t budget = 80 + 15 + strlen(name) + strlen(notes) + 9 + 4 + 18 + custom_data_len;
-if (budget > 380) {
-    Serial.println("[WAYPOINT] ERROR: Waypoint too large -- shorten name/notes");
-    return false;
-}
-```
-
-This gives the caller actionable feedback. **Severity: LOW** -- the overflow is already prevented.
-
----
-
-## 5. Decoder skip() for Unknown Keys — CORRECT
-
-```cpp
+if (ok) {
+    Serial.printf("[WAYPOINT] Sent: %s (%.6f, %.6f, %.1fm)\n", wp.name, wp.lat, wp.lon, wp.ele);
 } else {
-    dec.skip();  // Unknown key -- skip value
+    Serial.println("[WAYPOINT] Send failed (message may exceed size limit)");
 }
 ```
 
-`skip()` (msgpack.cpp:296-385) is comprehensive:
-- Handles all msgpack types: fixint, fixmap, fixarray, fixstr, nil, bool, bin8/16/32, ext8/16/32, float32/64, uint8/16/32/64, int8/16/32/64, fixext1-16, str8/16/32, array16/32, map16/32, negative fixint
-- Recursively skips nested containers (map/array)
-- Bounds checking: `if (pos > len) error = true` at line 384 catches any overrun
-- Handles the reserved `0xc1` tag (sets error)
-
-The `skip()` in the waypoint decoder correctly allows forward-compatible decoding -- future Python senders can add new keys without breaking firmware decode. **Good design.**
-
 ---
 
-## 6. Phase 4b Must-Fix Items — VERIFIED
+## 6. Test Coverage
 
-### 6a. encrypted[] buffer overflow pre-check — FIXED
-
-```cpp
-// lxmf_transport.cpp:99-105
-if (lxmf_len > 383) {
-    Serial.printf("[LXMF-TX] ERROR: Message too large for encrypted transport (%d > 383)\n", (int)lxmf_len);
-    return false;
-}
-```
-
-The pre-check uses the RNS ENCRYPTED_MDU value (383), matching the recommended Option B from the Phase 4b review. **Correctly implemented.**
-
-### 6b. Null guard on s_lxmf_dest — VERIFIED (commit 7ac78b1)
-
-### 6c. custom_type length 19 -> 18 — FIXED
-
-All instances in main_test.cpp now use `(const uint8_t*)"traildrop/waypoint", 18`. Verified at lines 2058, 2380, 2839. **No remaining instances of length 19.**
-
----
-
-## 7. Test Coverage
-
-### Phase 4c test suite (5 tests)
+### 6a. Test inventory (5 tests)
 
 | Test | What it covers | Verdict |
 |------|---------------|---------|
-| `test_waypoint_encode_decode_roundtrip` | Encode with all fields -> decode -> verify lat/lon/ele/name/notes/ts/valid | Good -- full field coverage |
-| `test_waypoint_encode_python_match` | Byte-for-byte match against Python msgpack.packb hex | Excellent -- proves interop |
-| `test_waypoint_in_lxmf_roundtrip` | Encode waypoint -> embed in LXMF -> build -> parse -> extract -> decode -> verify | Excellent -- full pipeline |
-| `test_waypoint_no_gps_fix` | Encode/decode with zero coords | Adequate (see gap #2 below) |
-| `test_waypoint_empty_notes` | Notes omitted (5-field map) -> byte-match Python -> decode -> verify empty | Good |
+| `test_waypoint_encode_decode_roundtrip` | Encode all 7 fields → decode → verify each | Good — primary path |
+| `test_waypoint_encode_python_match` | Byte-for-byte match vs Python msgpack hex | Excellent — interop proof |
+| `test_waypoint_in_lxmf_roundtrip` | Encode → lxmf_build → parse → extract custom_data → decode | Excellent — full pipeline |
+| `test_waypoint_no_gps_fix` | Encode/decode with zero coordinates | Adequate — see gap #3 |
+| `test_waypoint_empty_notes` | Notes omitted (5-field map) → byte-match Python → decode | Good — conditional field |
 
-### Test coverage gaps (ordered by priority)
+### 6b. Missing tests (ordered by priority)
 
-1. **No max-size waypoint test (MEDIUM)** -- The MDU budget analysis (section 4) shows that name=31 + notes>57 will be rejected by the 383-byte pre-check. No test verifies this boundary. A test that creates a waypoint with long name/notes and confirms `lxmf_send` returns false would validate the safety net.
+1. **No malformed input decoder tests (MEDIUM)** — The decoder's robustness (section 4) is comprehensive but untested. Should add at minimum:
+   - Truncated payload (first 10 bytes of a valid encoding)
+   - Wrong type for a value (string where float64 expected)
+   - Map with 0 entries → expect decode failure
 
-2. **test_waypoint_no_gps_fix is misnamed (LOW)** -- The test doesn't actually test `waypoint_send()` rejecting no-fix. It tests encode/decode of zero coordinates. The GPS rejection path (waypoint.cpp:89) is untested because `hal::gps_has_fix()` can't be mocked. The test is still useful (proves zero coords roundtrip), but the name is misleading.
+2. **No max-size waypoint rejection test (MEDIUM)** — A test with name=31 + notes=70 confirming `lxmf_send` rejects it (LXMF=385 > 383) would validate the MDU safety net. Also test notes=69 confirming it succeeds (LXMF=383, exact limit).
 
-3. **No unknown-key skip test (LOW)** -- The `skip()` function in the decoder is present and comprehensive, but no test exercises it. A test that adds an extra key to a msgpack waypoint and verifies decode still succeeds would validate forward-compatibility.
+3. **test_waypoint_no_gps_fix is misnamed (LOW)** — Tests encode/decode of zero coords, not the actual `waypoint_send` GPS refusal path (waypoint.cpp:89). Can't mock `gps_has_fix()` on device. The test is still useful but the name is misleading.
 
-4. **No negative coordinate test (LOW)** -- The roundtrip test uses negative longitude (-95.2353) which partially covers this. But extreme values like (-90.0, -180.0) or near-zero precision boundaries are untested. IEEE 754 double handles these natively, so risk is minimal.
+4. **No unknown-key skip test (LOW)** — The `skip()` call in the decoder is present and comprehensive, but no test exercises forward-compatible decoding with extra unknown keys.
 
-5. **No truncation test for oversized strings (LOW)** -- What happens if a received waypoint has a name > 31 chars? `read_str` with `max_len=31` sets `dec.error = true` and `waypoint_decode` returns false. This is correct but untested.
+5. **No oversized-string rejection test (LOW)** — A peer sending name > 31 bytes causes full decode failure. Correct behavior but untested.
+
+6. **Python test vector script lacks self-validation (LOW)** — The script generates hex but doesn't assert it matches expected values. Add `assert packed_full.hex() == "86a36c6174..."` for a two-way interop contract.
+
+---
+
+## 7. Phase 4b Review Items — VERIFIED FIXED
+
+All three items from the Phase 4b Cal review were addressed in commit 7ac78b1:
+
+1. **encrypted[] buffer overflow pre-check**: `if (lxmf_len > 383) return false` added at lxmf_transport.cpp:102. Uses RNS ENCRYPTED_MDU (Option B as recommended). ✓
+2. **Null guard on s_lxmf_dest**: `s_lxmf_dest &&` added at lxmf_transport.cpp:187. ✓
+3. **custom_type length 19 → 18**: Fixed. Phase 4c's `waypoint_send` design makes this class of bug impossible — the length is always hardcoded alongside the string. ✓
 
 ---
 
 ## 8. Additional Findings
 
-### 8a. ele cast to double is redundant — COSMETIC
+### 8a. write_bin(nullptr, 0) UB — STILL PRESENT (from Phase 4b review)
+
+`lxmf_build` can call `enc.write_bin(custom_data, custom_data_len)` where `custom_data=nullptr` and `custom_data_len=0`. This flows to `memcpy(buf+pos, nullptr, 0)` — UB per C/C++ spec. Most implementations handle it, but sanitizers will flag it. **Severity: LOW.** Fix: guard with `if (len > 0)` in `write_bytes`.
+
+### 8b. Explicit double cast is redundant — COSMETIC
 
 ```cpp
 enc.write_float64((double)wp.ele);  // waypoint.cpp:26
@@ -297,71 +245,34 @@ enc.write_float64((double)wp.ele);  // waypoint.cpp:26
 
 C++ implicitly promotes `float` to `double` in function calls. The explicit cast is harmless but unnecessary.
 
-### 8b. timestamp uses millis()/1000 — DESIGN NOTE
-
-```cpp
-wp.timestamp = (uint32_t)(millis() / 1000);  // waypoint.cpp:116
-```
-
-This is uptime in seconds, not Unix time. Without an RTC or NTP, the device can't produce real timestamps. The Python test vector uses a real Unix timestamp (1709312400 = 2024-03-01T19:00:00Z). The comment says "Uptime as placeholder" -- correct for current hardware constraints. When GPS provides UTC time, this should be updated. **Not a bug -- documented limitation.**
-
-### 8c. waypoint_send_explicit passes name as both LXMF title and waypoint name — INTENTIONAL DUPLICATION
-
-```cpp
-strncpy(wp.name, name ? name : "Waypoint", sizeof(wp.name) - 1);  // waypoint struct
-// ...
-lxmf_send(..., name ? name : "Waypoint", notes ? notes : "", ...);  // LXMF title/content
-```
-
-The name appears twice in the wire payload: once in the LXMF title (for non-TrailDrop receivers) and once in the msgpack custom_data (for TrailDrop receivers). This is intentional for compatibility, but uses ~2x the bytes for name/notes. With the MDU budget being tight (section 4), this duplication is the primary reason long notes exceed the limit.
-
-**Optional optimization**: Set LXMF title to a fixed short string like "WP" and content to "" when sending waypoints. This would free ~(name_len + notes_len) bytes in the payload, allowing longer waypoint notes. Trade-off: non-TrailDrop LXMF clients would see "WP" instead of the waypoint name.
-
-### 8d. Python test vector does not verify key order explicitly — MINOR GAP
-
-The Python script calls `msgpack.packb(wp_full)` and prints the hex, but doesn't assert a specific byte sequence. The firmware test hardcodes the expected hex. If Python's msgpack library changes dict serialization order in a future version, the firmware test would still pass (it's hardcoded), but re-running the Python script would produce different output.
-
-**Suggestion**: Add `assert packed_full.hex() == "expected..."` to the Python script for a two-way interop contract.
-
-### 8e. auto-send uses "traildrop/waypoint" custom_type with no custom_data — COSMETIC
-
-```cpp
-// main_test.cpp:2839
-(const uint8_t*)"traildrop/waypoint", 18,
-nullptr, 0,
-```
-
-The auto-send path sends an LXMF with custom_type="traildrop/waypoint" but empty custom_data. A receiver checking for custom_type would identify this as a waypoint message, but `waypoint_decode` on empty data would fail. This is a test harness path, not production code.
-
-### 8f. Phase 4b should-fix: write_bin(nullptr, 0) UB — STILL PRESENT
-
-The `write_bytes(nullptr, 0)` UB issue flagged in Phase 4b section 8c remains unfixed. `lxmf_build` at lxmf.cpp:36 calls `enc.write_bin(custom_data, custom_data_len)` where `custom_data` can be nullptr and `custom_data_len` can be 0. This flows to `memcpy(buf+pos, nullptr, 0)`. Still technically UB per C/C++ spec. **Severity: LOW.**
-
 ---
 
 ## 9. Summary — Verdict
 
 ### Overall: PASS (clean)
 
-Phase 4c is a well-implemented, compact module. The waypoint codec is correct, the string handling is bounds-checked at every level, lat/lon use true float64 encoding, and the Python interop is verified byte-for-byte. The decoder includes a proper `skip()` for forward compatibility with unknown keys.
+Phase 4c is a well-implemented, compact module. The waypoint codec is correct: lat/lon use true float64 encoding with verified Python interop, string handling is bounds-checked at every level via the Encoder/Decoder error-flag pattern, and the decoder includes comprehensive `skip()` for forward-compatible unknown-key handling. The GPS HAL interface preserves full double precision for coordinates.
 
-The Phase 4b must-fix item (encrypted buffer overflow) was correctly addressed with the 383-byte pre-check, which now serves as the safety net preventing oversized waypoints from causing memory corruption. All three Phase 4b should-fix items (null guard, custom_type length, size test) have been addressed.
+The Phase 4b must-fix (encrypted buffer overflow) was correctly addressed and now serves as the safety net preventing oversized waypoints from causing memory corruption. All three Phase 4b should-fix items have been resolved.
 
 ### No must-fix items
 
 ### Should-fix
 
-1. **Add max-size waypoint rejection test (MEDIUM)** -- Verify that `lxmf_send` rejects a waypoint with max-length name (31 chars) + long notes (>57 chars). This exercises the 383-byte MDU pre-check on the waypoint path specifically.
-2. **Improve error message for oversized waypoints (LOW)** -- Add a pre-check in `waypoint_send_explicit` with a "shorten name/notes" message for actionable feedback.
-3. **Add Python hex assertion (LOW)** -- Add `assert packed_full.hex() == "expected..."` to phase4c_test_vectors.py for two-way interop contract.
+1. **Add required-field validation in waypoint_decode** (section 4e) — `wp.valid = true` is unconditional. A malformed message with unrecognized-only keys produces a "valid" waypoint at (0°, 0°). Track `got_lat`/`got_lon` flags and require them for `valid = true`.
+
+2. **Add failure log in waypoint_send_explicit** (section 5) — When `lxmf_send` returns false, there's no log from the waypoint layer. Add an else branch with a failure message for debugging.
+
+3. **Add malformed-input decoder tests** (section 6b) — The decoder is robust, but that robustness is unverified by tests. At minimum: truncated payload, wrong value type.
 
 ### Nice-to-have
 
-4. Add unknown-key skip test for forward-compatibility validation.
-5. Add oversized-string decode rejection test (name >31 chars from malicious sender).
+4. Add max-size waypoint rejection test (validates MDU boundary).
+5. Add unknown-key skip test for forward-compatibility verification.
 6. Fix `write_bin(nullptr, 0)` UB (carried from Phase 4b).
-7. Rename `test_waypoint_no_gps_fix` to reflect what it actually tests (zero-coord roundtrip).
-8. Consider encoding elevation as float32 to save 4 bytes per waypoint.
+7. Rename `test_waypoint_no_gps_fix` to `test_waypoint_zero_coords_roundtrip`.
+8. Add self-validation assertions to Python test vector script.
+9. Consider encoding elevation as float32 to save 4 bytes per waypoint.
 
 ---
 
