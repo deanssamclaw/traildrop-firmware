@@ -7,9 +7,9 @@
 namespace hal {
 
 bool storage_init() {
-    // Ensure SPI bus is configured
-    SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
-
+    // SPI bus already initialized in main setup() — SD.begin() will call
+    // SPI.begin() internally (idempotent no-op)
+    
     if (!SD.begin(PIN_SDCARD_CS, SPI, SD_INIT_FREQ)) {
         Serial.println("[SD]  Card mount failed");
         return false;

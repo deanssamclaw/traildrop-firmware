@@ -6,6 +6,7 @@
 // ============================================================
 
 #include <Arduino.h>
+#include <SPI.h>
 #include "config.h"
 #include "hal/power.h"
 #include "hal/display.h"
@@ -20,6 +21,24 @@
 #include "crypto/encrypt.h"
 #include "crypto/token.h"
 #include <RNG.h>
+
+// Boot health tracking — single source of truth for init results
+struct BootHealth {
+    bool power    = false;
+    bool display  = false;
+    bool keyboard = false;
+    bool trackball = false;
+    bool gps      = false;
+    bool radio    = false;
+    bool storage  = false;
+    bool battery  = false;
+
+    bool spi_ready() const { return power; }  // SPI depends on power (GPIO 10)
+    bool can_network() const { return radio && storage; }  // Need radio + identity from SD
+    bool has_display() const { return display; }
+};
+
+static BootHealth boot;
 
 // Boot status display — shows init results on screen
 static void show_boot_status(const char* module, bool ok, int line) {
@@ -386,43 +405,61 @@ void setup() {
     Serial.printf("\n=== TrailDrop %s — HAL Test Harness ===\n", APP_VERSION);
 
     // Phase 1: Boot sequence (power_init MUST be first)
-    bool ok_power = hal::power_init();
-    Serial.printf("[BOOT] Power:    %s\n", ok_power ? "OK" : "FAIL");
+    boot.power = hal::power_init();
+    Serial.printf("[BOOT] Power:    %s\n", boot.power ? "OK" : "FAIL");
+    
+    if (!boot.power) {
+        Serial.println("[BOOT] CRITICAL: Power init failed — peripherals unpowered");
+        // Still try display in case it works on USB power
+    }
 
-    bool ok_display = hal::display_init();
-    Serial.printf("[BOOT] Display:  %s\n", ok_display ? "OK" : "FAIL");
+    // SPI bus initialization — centralized, called once
+    // Note: CS pins already pre-initialized HIGH by power_init() in power.cpp
+    SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
+    
+    // Note: TFT_eSPI::init(), RadioLib Module::init(), and SD.begin() all call
+    // SPI.begin() internally — these are idempotent no-ops since we init first.
+    
+    // TODO Phase 3: When introducing concurrent FreeRTOS tasks for networking,
+    // add a Meshtastic-style LockingArduinoHal for RadioLib and wrap display/SD
+    // operations with the same global spiLock. See SPI_RESEARCH.md for the pattern.
+    // Current single-threaded architecture is protected by Arduino SPI's built-in
+    // FreeRTOS mutex (SPI.beginTransaction() calls xSemaphoreTake internally).
+
+    boot.display = hal::display_init();
+    Serial.printf("[BOOT] Display:  %s\n", boot.display ? "OK" : "FAIL");
 
     // Show boot status on display
     hal::display_clear(0x0000);
     hal::display_text(0, 0, "TrailDrop HAL Test", 0xFFFF, 2);
 
     int line = 2;
-    show_boot_status("Power",    ok_power,   line++);
-    show_boot_status("Display",  ok_display, line++);
+    show_boot_status("Power",    boot.power,   line++);
+    show_boot_status("Display",  boot.display, line++);
 
-    bool ok_kb = hal::keyboard_init();
-    Serial.printf("[BOOT] Keyboard: %s\n", ok_kb ? "OK" : "FAIL");
-    show_boot_status("Keyboard", ok_kb, line++);
+    boot.keyboard = hal::keyboard_init();
+    Serial.printf("[BOOT] Keyboard: %s\n", boot.keyboard ? "OK" : "FAIL");
+    show_boot_status("Keyboard", boot.keyboard, line++);
 
-    bool ok_tb = hal::trackball_init();
-    Serial.printf("[BOOT] Trackball:%s\n", ok_tb ? "OK" : "FAIL");
-    show_boot_status("Trackball", ok_tb, line++);
+    boot.trackball = hal::trackball_init();
+    Serial.printf("[BOOT] Trackball:%s\n", boot.trackball ? "OK" : "FAIL");
+    show_boot_status("Trackball", boot.trackball, line++);
 
-    bool ok_gps = hal::gps_init();
-    Serial.printf("[BOOT] GPS:      %s\n", ok_gps ? "OK" : "FAIL");
-    show_boot_status("GPS",      ok_gps, line++);
+    boot.gps = hal::gps_init();
+    Serial.printf("[BOOT] GPS:      %s\n", boot.gps ? "OK" : "FAIL");
+    show_boot_status("GPS",      boot.gps, line++);
 
-    bool ok_radio = hal::radio_init();
-    Serial.printf("[BOOT] Radio:    %s\n", ok_radio ? "OK" : "FAIL");
-    show_boot_status("Radio",    ok_radio, line++);
+    boot.radio = hal::radio_init();
+    Serial.printf("[BOOT] Radio:    %s\n", boot.radio ? "OK" : "FAIL");
+    show_boot_status("Radio",    boot.radio, line++);
 
-    bool ok_sd = hal::storage_init();
-    Serial.printf("[BOOT] Storage:  %s\n", ok_sd ? "OK" : "FAIL");
-    show_boot_status("Storage",  ok_sd, line++);
+    boot.storage = hal::storage_init();
+    Serial.printf("[BOOT] Storage:  %s\n", boot.storage ? "OK" : "FAIL");
+    show_boot_status("Storage",  boot.storage, line++);
 
-    bool ok_bat = hal::battery_init();
-    Serial.printf("[BOOT] Battery:  %s\n", ok_bat ? "OK" : "FAIL");
-    show_boot_status("Battery",  ok_bat, line++);
+    boot.battery = hal::battery_init();
+    Serial.printf("[BOOT] Battery:  %s\n", boot.battery ? "OK" : "FAIL");
+    show_boot_status("Battery",  boot.battery, line++);
 
     // Battery reading
     float volts = hal::battery_voltage();
@@ -432,7 +469,7 @@ void setup() {
     line++;
 
     // Storage info
-    if (ok_sd) {
+    if (boot.storage) {
         uint64_t total = hal::storage_total_bytes();
         uint64_t used  = hal::storage_used_bytes();
         Serial.printf("[BOOT] SD: %llu MB total, %llu MB used\n",
@@ -440,15 +477,33 @@ void setup() {
     }
 
     // Start radio receive mode
-    if (ok_radio) {
+    if (boot.radio) {
         hal::radio_start_receive();
         Serial.println("[BOOT] Radio: listening");
+    }
+
+    // Boot health summary
+    Serial.printf("[BOOT] Health: %s%s%s%s%s%s%s%s\n",
+        boot.power    ? "P" : "p",
+        boot.display  ? "D" : "d",
+        boot.keyboard ? "K" : "k",
+        boot.trackball ? "T" : "t",
+        boot.gps      ? "G" : "g",
+        boot.radio    ? "R" : "r",
+        boot.storage  ? "S" : "s",
+        boot.battery  ? "B" : "b");
+    // Uppercase = OK, lowercase = failed. e.g., "PDKTGRsB" means storage failed.
+
+    if (boot.can_network()) {
+        Serial.println("[BOOT] Network-ready: radio + storage OK");
+    } else {
+        Serial.println("[BOOT] Network-degraded: missing radio or storage");
     }
 
     Serial.println("[BOOT] === Init complete ===\n");
     
     // Phase 2: Run crypto tests
-    if (ok_sd) {
+    if (boot.storage) {
         line++; // Add spacing
         run_crypto_tests(line);
     } else {

@@ -15,9 +15,9 @@ static void IRAM_ATTR radioISR() {
 namespace hal {
 
 bool radio_init() {
-    // Ensure SPI bus is configured with T-Deck pins
-    SPI.begin(PIN_SPI_SCK, PIN_SPI_MISO, PIN_SPI_MOSI);
-
+    // SPI bus already initialized in main setup() — Module::init() will call
+    // SPI.begin() internally (idempotent no-op)
+    
     radio = new SX1262(new Module(PIN_RADIO_CS, PIN_RADIO_DIO1,
                                    PIN_RADIO_RST, PIN_RADIO_BUSY, SPI));
 
