@@ -12,8 +12,6 @@ bool announce_build(const crypto::Identity& id,
                     const Destination& dest,
                     const char* app_data,
                     Packet& out_pkt) {
-    Serial.printf("[ANNOUNCE] DEBUG: build called, app_name='%s' aspects='%s' app_data='%s'\n",
-        dest.app_name, dest.aspects, app_data ? app_data : "(null)");
     // Compute full_name for name_hash
     char full_name[130];  // max: 64 app_name + 1 dot + 64 aspects + 1 null
     snprintf(full_name, sizeof(full_name), "%s.%s", dest.app_name, dest.aspects);
@@ -64,14 +62,12 @@ bool announce_build(const crypto::Identity& id,
     // Sign with Ed25519
     uint8_t signature[64];
     if (!crypto::identity_sign(id, signed_data, signed_len, signature)) {
-        Serial.printf("[ANNOUNCE] DEBUG: identity_sign failed, signed_len=%d\n", (int)signed_len);
         return false;
     }
     
     // Assemble payload: public_key(64) + name_hash(10) + random_hash(10) + signature(64) [+ app_data]
     size_t payload_len = 64 + 10 + 10 + 64 + app_data_len;
     if (payload_len > RNS_MTU) {
-        Serial.printf("[ANNOUNCE] DEBUG: payload too large: %d\n", (int)payload_len);
         return false;  // Payload too large
     }
     
