@@ -1308,6 +1308,10 @@ void setup() {
         net::peer_table_init();
         if (identity_ready && boot.radio) {
             net::transport_init(device_identity, device_destination);
+            // Re-announce after tests — boot announce was likely lost while
+            // the other device was also running self-tests
+            net::transport_announce(APP_NAME);
+            Serial.println("[NET] Post-test re-announce sent");
         }
     } else {
         Serial.println("[CRYPTO] Skipping crypto tests - SD card required");
