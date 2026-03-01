@@ -96,6 +96,14 @@ bool lxmf_send(
         return false;
     }
 
+    // Pre-check: LXMF plaintext must fit in encrypted MTU
+    // identity_encrypt adds ~81-96 bytes overhead (ephemeral key + IV + padding + HMAC)
+    // RNS ENCRYPTED_MDU = MTU - overhead ≈ 383 bytes
+    if (lxmf_len > 383) {
+        Serial.printf("[LXMF-TX] ERROR: Message too large for encrypted transport (%d > 383)\n", (int)lxmf_len);
+        return false;
+    }
+
     // Step 3: Encrypt for peer
     crypto::Identity peer_id;
     memcpy(peer_id.x25519_public, peer->x25519_public, 32);
@@ -176,7 +184,7 @@ void lxmf_transport_poll() {
 
         case PKT_DATA: {
             // Check if addressed to our LXMF destination
-            if (memcmp(pkt.dest_hash, s_lxmf_dest->hash, DEST_HASH_SIZE) == 0) {
+            if (s_lxmf_dest && memcmp(pkt.dest_hash, s_lxmf_dest->hash, DEST_HASH_SIZE) == 0) {
                 // Decrypt with our identity
                 uint8_t decrypted[RNS_MTU];
                 size_t dec_len = 0;

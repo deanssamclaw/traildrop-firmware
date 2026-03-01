@@ -2501,7 +2501,7 @@ void loop() {
                         device_identity, device_lxmf_destination.hash,
                         peer->dest_hash,
                         "Test", "Hello from TrailDrop!",
-                        (const uint8_t*)"traildrop/waypoint", 19,
+                        (const uint8_t*)"traildrop/waypoint", 18,
                         nullptr, 0,
                         msg_hash)) {
                     Serial.println("[TEST] LXMF message sent successfully");
@@ -2575,7 +2575,7 @@ void loop() {
                     device_identity, device_lxmf_destination.hash,
                     peer->dest_hash,
                     "Test", "Hello from TrailDrop!",
-                    (const uint8_t*)"traildrop/waypoint", 19,
+                    (const uint8_t*)"traildrop/waypoint", 18,
                     nullptr, 0,
                     msg_hash);
             } else {
