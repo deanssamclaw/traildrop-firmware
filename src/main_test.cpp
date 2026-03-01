@@ -52,7 +52,7 @@ static bool test_hmac_sha256() {
     const uint8_t key[] = "key";
     const uint8_t data[] = "The quick brown fox jumps over the lazy dog";
     uint8_t hmac[32];
-    crypto::hmac_sha256(key, 3, data, 44, hmac);
+    crypto::hmac_sha256(key, 3, data, 43, hmac);
 
     const uint8_t expected[32] = {
         0xf7, 0xbc, 0x83, 0xf4, 0x30, 0x53, 0x84, 0x24,
