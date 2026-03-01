@@ -326,7 +326,7 @@ def test_1d_encryption():
     # --- ESP32 algorithm decryption of RNS-encrypted token ---
     # Replicate ESP32's identity_decrypt in Python:
     # 1. Extract ephemeral pub
-    eph_pub_obj = X25519PublicKey.from_raw_public_bytes(ephemeral_pub)
+    eph_pub_obj = X25519PublicKey.from_public_bytes(ephemeral_pub)
 
     # 2. ECDH with recipient's private key
     shared_key = target.prv.exchange(eph_pub_obj)
