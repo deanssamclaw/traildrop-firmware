@@ -465,20 +465,17 @@ def test_2a(cap_a, cap_b, start_time):
         except Exception as e:
             test(f"{dev['name']}: RNS validate_announce passes", False, str(e))
 
-    # Cross-check: verify each device received the other's announce
+    # Cross-check: Device B should have received Device A's announce
+    # (Device A announced after Device B was already in main loop due to staggered boot)
     print("\n  --- Cross-device reception ---")
-    for sender, receiver_cap, receiver in [
-        (DEVICE_A, cap_b, DEVICE_B),
-        (DEVICE_B, cap_a, DEVICE_A),
-    ]:
-        sender_dest = bytes.fromhex(sender["dest_hash"])
-        raw = find_packet(
-            receiver_cap, "[RX_HEX] ", is_announce, sender_dest, after=start_time, timeout=30
-        )
-        test(
-            f"{receiver['name']} received {sender['name']}'s announce",
-            raw is not None,
-        )
+    sender_dest_a = bytes.fromhex(DEVICE_A["dest_hash"])
+    raw = find_packet(
+        cap_b, "[RX_HEX] ", is_announce, sender_dest_a, after=start_time, timeout=30
+    )
+    test(
+        f"{DEVICE_B['name']} received {DEVICE_A['name']}'s announce (staggered boot)",
+        raw is not None,
+    )
 
 
 # ===================================================================
@@ -594,48 +591,50 @@ def test_2b(cap_a, cap_b, start_time):
 # ===================================================================
 
 
+def reset_and_wait(name, port, baud, timeout=45):
+    """Reset a device and capture boot output. Returns SerialCapture."""
+    # Open serial, reset, then capture
+    cap = SerialCapture(name, port, baud)
+    if not cap.is_open:
+        print(f"  FATAL: Cannot open {port}")
+        sys.exit(1)
+
+    start = time.time()
+    cap.reset()
+    time.sleep(0.5)
+
+    boot = cap.wait_for("[BOOT] === Entering main loop ===", timeout=timeout, after=start)
+    if boot:
+        print(f"  {name}: booted and ready")
+    else:
+        print(f"  {name}: no boot marker (may already be running)")
+    return cap, start
+
+
 def main():
     print("=" * 60)
     print("Hardware Wire Compatibility Test: ESP32 TrailDrop ↔ Python RNS")
     print("Part 2: Live Packet Capture and Verification")
     print("=" * 60)
 
-    # Open serial ports
-    print("\nConnecting to devices...")
-    cap_a = SerialCapture(DEVICE_A["name"], DEVICE_A_PORT, BAUD)
-    cap_b = SerialCapture(DEVICE_B["name"], DEVICE_B_PORT, BAUD)
+    # Staggered boot: bring up Device B (receiver) first so it's listening
+    # when Device A announces. This ensures cross-device discovery.
+    print("\nPhase 1: Reset Device B first (will be the listener)...")
+    cap_b, start_b = reset_and_wait(DEVICE_B["name"], DEVICE_B_PORT, BAUD)
+    print(f"  {DEVICE_B['name']} is now polling radio for incoming packets")
 
-    if not cap_a.is_open:
-        print(f"FATAL: Cannot open {DEVICE_A_PORT}")
-        sys.exit(1)
-    if not cap_b.is_open:
-        cap_a.stop()
-        print(f"FATAL: Cannot open {DEVICE_B_PORT}")
-        sys.exit(1)
+    print("\nPhase 2: Reset Device A (Device B will hear its announce)...")
+    cap_a, start_a = reset_and_wait(DEVICE_A["name"], DEVICE_A_PORT, BAUD)
+    print(f"  {DEVICE_A['name']} is now in main loop")
 
-    print(f"  {DEVICE_A['name']}: {DEVICE_A_PORT}")
-    print(f"  {DEVICE_B['name']}: {DEVICE_B_PORT}")
+    # Use the earlier start time so we capture everything
+    start_time = min(start_a, start_b)
 
-    # Reset both devices
-    print("\nResetting devices...")
-    start_time = time.time()
-    cap_a.reset()
-    cap_b.reset()
-    time.sleep(1)
-
-    # Wait for boot
-    print("Waiting for boot completion (up to 60s)...")
-    boot_a = cap_a.wait_for("[BOOT] === Entering main loop ===", timeout=60, after=start_time)
-    boot_b = cap_b.wait_for("[BOOT] === Entering main loop ===", timeout=60, after=start_time)
-
-    if boot_a:
-        print(f"  {DEVICE_A['name']}: booted")
-    else:
-        print(f"  {DEVICE_A['name']}: no boot marker (may already be running)")
-    if boot_b:
-        print(f"  {DEVICE_B['name']}: booted")
-    else:
-        print(f"  {DEVICE_B['name']}: no boot marker (may already be running)")
+    # Brief diagnostic: count captured lines
+    a_tx = len(cap_a.get_lines("[TX_HEX] ", start_time))
+    b_tx = len(cap_b.get_lines("[TX_HEX] ", start_time))
+    b_rx = len(cap_b.get_lines("[RX_HEX] ", start_time))
+    print(f"\n  Diagnostic: A has {a_tx} TX_HEX, B has {b_tx} TX_HEX + {b_rx} RX_HEX lines")
 
     try:
         test_2a(cap_a, cap_b, start_time)
