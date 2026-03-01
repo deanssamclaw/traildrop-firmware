@@ -633,6 +633,31 @@ def test_2b_data_capture(ser_a, ser_b, announce):
 
 
 # ---------------------------------------------------------------------------
+# Identity key caching from boot output
+# ---------------------------------------------------------------------------
+
+def cache_identity_from_boot(boot_lines, device_name, cache_dir):
+    """Extract [ID_KEY] hex from boot output and cache to file."""
+    for line in boot_lines:
+        if "[ID_KEY]" in line:
+            hex_key = line.split("[ID_KEY]")[-1].strip()
+            try:
+                key_bytes = bytes.fromhex(hex_key)
+                if len(key_bytes) == 128:
+                    cache_path = os.path.join(cache_dir, f"{device_name}_identity.dat")
+                    with open(cache_path, "wb") as f:
+                        f.write(key_bytes)
+                    print(f"  Cached {device_name} identity key ({len(hex_key)} hex chars)")
+                    return True
+                else:
+                    print(f"  WARN: [ID_KEY] for {device_name} has {len(key_bytes)} bytes, expected 128")
+            except ValueError as e:
+                print(f"  WARN: [ID_KEY] hex parse error for {device_name}: {e}")
+    print(f"  WARN: No [ID_KEY] found in {device_name} boot output ({len(boot_lines)} lines)")
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -658,55 +683,29 @@ def main():
     # Staggered reset: Boot Device B (receiver) first, wait for it to enter
     # the main loop and be ready to receive, then reset Device A (sender).
     # This ensures Device A's announce arrives when Device B is listening.
+    # IMPORTANT: Read serial continuously during boot to avoid buffer overflow.
+    identity_cache_dir = os.path.join(os.path.dirname(__file__), ".identity_cache")
+    os.makedirs(identity_cache_dir, exist_ok=True)
+
     print("\nResetting Device B (receiver) first...")
     reset_device(ser_b)
     print("Waiting for Device B to boot and enter main loop (25s)...")
-    time.sleep(25)
-    boot_b = drain_and_collect(ser_b, timeout=3)
+    boot_b = drain_and_collect(ser_b, timeout=25)
     print(f"  Device B: {len(boot_b)} lines of boot output")
     b_ready = any("[NET]" in l or "Entering main loop" in l for l in boot_b)
     if not b_ready:
         print("  WARN: Device B may not have network initialized")
-
-    # Extract and cache Device B identity key
-    identity_cache_dir = os.path.join(os.path.dirname(__file__), ".identity_cache")
-    os.makedirs(identity_cache_dir, exist_ok=True)
-    for line in boot_b:
-        if "[ID_KEY]" in line:
-            hex_key = line.split("[ID_KEY]")[-1].strip()
-            try:
-                key_bytes = bytes.fromhex(hex_key)
-                if len(key_bytes) == 128:
-                    cache_path = os.path.join(identity_cache_dir, "device_b_identity.dat")
-                    with open(cache_path, "wb") as f:
-                        f.write(key_bytes)
-                    print(f"  Cached Device B identity key")
-            except ValueError:
-                pass
+    cache_identity_from_boot(boot_b, "device_b", identity_cache_dir)
 
     print("\nNow resetting Device A (sender)...")
     reset_device(ser_a)
     print("Waiting for Device A to boot (25s)...")
-    time.sleep(25)
-    boot_a = drain_and_collect(ser_a, timeout=3)
+    boot_a = drain_and_collect(ser_a, timeout=25)
     print(f"  Device A: {len(boot_a)} lines of boot output")
     a_ready = any("[NET]" in l or "Entering main loop" in l for l in boot_a)
     if not a_ready:
         print("  WARN: Device A may not have network initialized")
-
-    # Extract and cache Device A identity key
-    for line in boot_a:
-        if "[ID_KEY]" in line:
-            hex_key = line.split("[ID_KEY]")[-1].strip()
-            try:
-                key_bytes = bytes.fromhex(hex_key)
-                if len(key_bytes) == 128:
-                    cache_path = os.path.join(identity_cache_dir, "device_a_identity.dat")
-                    with open(cache_path, "wb") as f:
-                        f.write(key_bytes)
-                    print(f"  Cached Device A identity key")
-            except ValueError:
-                pass
+    cache_identity_from_boot(boot_a, "device_a", identity_cache_dir)
 
     # Run tests
     announce = test_2a_announce_capture(ser_a, ser_b)
