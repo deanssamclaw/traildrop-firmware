@@ -1,6 +1,6 @@
 #pragma once
-// LVGL UI manager
-// TODO: Phase 5 implementation
+// LVGL UI manager — Phase 5 (future)
+// ui_init() and ui_update() are now in display_ui.h (Phase 4d).
 
 namespace ui {
 
@@ -14,8 +14,6 @@ enum Screen {
     SCREEN_EMERGENCY,
 };
 
-bool ui_init();
 void ui_show(Screen screen);
-void ui_update();  // Called from main loop
 
 } // namespace ui
