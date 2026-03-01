@@ -1298,8 +1298,10 @@ void setup() {
         line++; // Add spacing
         run_transport_tests(line);
         
-        // Re-initialize transport with real device identity/destination
-        // (transport tests overwrite s_identity/s_destination with stack-local pointers)
+        // Re-initialize after tests:
+        // - Transport tests overwrite s_identity/s_destination with stack-local pointers
+        // - Announce tests leave stale test peers in the peer table
+        net::peer_table_init();
         if (identity_ready && boot.radio) {
             net::transport_init(device_identity, device_destination);
         }
