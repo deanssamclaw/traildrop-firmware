@@ -85,4 +85,13 @@ int peer_count() {
     return count;
 }
 
+const Peer* peer_first() {
+    for (int i = 0; i < MAX_PEERS; i++) {
+        if (peer_table[i].valid) {
+            return &peer_table[i];
+        }
+    }
+    return nullptr;
+}
+
 } // namespace net

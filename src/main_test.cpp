@@ -1316,6 +1316,29 @@ void loop() {
     char key = hal::keyboard_read();
     if (key) {
         Serial.printf("[KB] Key: 0x%02X '%c'\n", key, (key >= 32 && key < 127) ? key : '.');
+        
+        // Test triggers
+        if (key == 's' && identity_ready) {
+            // Send test message to first known peer
+            const net::Peer* peer = net::peer_first();
+            if (peer) {
+                const char* msg = "Hello from TrailDrop!";
+                Serial.printf("[TEST] Sending to peer %02x%02x%02x%02x...\n",
+                    peer->dest_hash[0], peer->dest_hash[1],
+                    peer->dest_hash[2], peer->dest_hash[3]);
+                if (net::transport_send_data(peer->dest_hash, (const uint8_t*)msg, strlen(msg))) {
+                    Serial.println("[TEST] Message sent successfully");
+                } else {
+                    Serial.println("[TEST] Send failed");
+                }
+            } else {
+                Serial.println("[TEST] No peers discovered yet");
+            }
+        } else if (key == 'a' && identity_ready) {
+            // Force announce
+            net::transport_announce(APP_NAME);
+        }
+        
         if (key_pos < (int)sizeof(last_keys) - 1) {
             last_keys[key_pos++] = (key >= 32 && key < 127) ? key : '.';
             last_keys[key_pos] = '\0';

@@ -35,4 +35,7 @@ const Peer* peer_lookup(const uint8_t dest_hash[DEST_HASH_SIZE]);
 // Get count of valid peers
 int peer_count();
 
+// Get first valid peer (for testing). Returns nullptr if no peers.
+const Peer* peer_first();
+
 } // namespace net
