@@ -124,6 +124,15 @@ bool waypoint_send_explicit(
         return false;
     }
 
+    // Pre-check: estimate total LXMF size to give actionable feedback
+    size_t title_len = strlen(name ? name : "Waypoint");
+    size_t content_len = strlen(notes ? notes : "");
+    size_t est_payload = 80 + 15 + title_len + content_len + 9 + 4 + 18 + custom_data_len;
+    if (est_payload > 380) {
+        Serial.printf("[WAYPOINT] ERROR: Too large (%d bytes) — shorten name/notes\n", (int)est_payload);
+        return false;
+    }
+
     // Send via LXMF with custom fields
     uint8_t msg_hash[32];
     bool ok = lxmf_send(
