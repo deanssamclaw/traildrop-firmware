@@ -289,10 +289,16 @@ def test_1d_encryption():
     print("\n=== Test 1d: Encryption/Decryption Cross-Test ===")
 
     import RNS
-    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey, X25519PublicKey
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey as PyCA_X25519PrivateKey,
+        X25519PublicKey as PyCA_X25519PublicKey,
+    )
 
     # Create a target identity (the "recipient")
     target = RNS.Identity(create_keys=True)
+    # Extract raw private key bytes for direct PyCA operations
+    target_prv_bytes = target.prv_bytes   # 32 bytes (x25519 private)
+    target_pub_bytes = target.pub_bytes   # 32 bytes (x25519 public)
 
     # --- Python RNS encryption ---
     plaintext = b"Hello from Python!"
@@ -324,18 +330,18 @@ def test_1d_encryption():
          f"Got: {decrypted}")
 
     # --- ESP32 algorithm decryption of RNS-encrypted token ---
-    # Replicate ESP32's identity_decrypt in Python:
-    # 1. Extract ephemeral pub
-    eph_pub_obj = X25519PublicKey.from_public_bytes(ephemeral_pub)
+    # Use raw PyCA keys to avoid RNS proxy issues
+    eph_pub_obj = PyCA_X25519PublicKey.from_public_bytes(ephemeral_pub)
+    target_prv_obj = PyCA_X25519PrivateKey.from_private_bytes(target_prv_bytes)
 
-    # 2. ECDH with recipient's private key
-    shared_key = target.prv.exchange(eph_pub_obj)
+    # ECDH with recipient's private key
+    shared_key = target_prv_obj.exchange(eph_pub_obj)
 
-    # 3. HKDF with identity_hash as salt
+    # HKDF with identity_hash as salt
     salt = target.hash  # identity_hash (16 bytes)
     derived = esp32_hkdf_sha256(shared_key, salt, b"", 64)
 
-    # 4. Token decrypt
+    # Token decrypt
     signing_key = derived[:32]
     encryption_key = derived[32:]
     esp32_decrypted = esp32_token_decrypt(signing_key, encryption_key, token_body)
@@ -347,19 +353,20 @@ def test_1d_encryption():
     # --- ESP32 algorithm encryption, RNS decryption ---
     plaintext2 = b"Hello from ESP32!"
 
-    # Generate ephemeral key
-    eph_prv = X25519PrivateKey.generate()
+    # Generate ephemeral key using raw PyCA
+    eph_prv = PyCA_X25519PrivateKey.generate()
     eph_pub_bytes = eph_prv.public_key().public_bytes_raw()
 
-    # ECDH with target's public key
-    shared_key2 = eph_prv.exchange(target.pub)
+    # ECDH with target's public key (using raw PyCA)
+    target_pub_obj = PyCA_X25519PublicKey.from_public_bytes(target_pub_bytes)
+    shared_key2 = eph_prv.exchange(target_pub_obj)
 
     # HKDF
     derived2 = esp32_hkdf_sha256(shared_key2, target.hash, b"", 64)
     signing_key2 = derived2[:32]
     encryption_key2 = derived2[32:]
 
-    # Token encrypt (with known IV for determinism)
+    # Token encrypt
     iv2 = os.urandom(16)
     token_body2 = esp32_token_encrypt(signing_key2, encryption_key2, plaintext2, iv2)
     esp32_encrypted = eph_pub_bytes + token_body2
@@ -418,10 +425,12 @@ def test_1e_hkdf():
          rns_empty_salt == esp32_empty_salt)
 
     # Test with real ECDH shared key scenario
-    from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey as PyCA_X25519Prv,
+    )
 
-    alice_prv = X25519PrivateKey.generate()
-    bob_prv = X25519PrivateKey.generate()
+    alice_prv = PyCA_X25519Prv.generate()
+    bob_prv = PyCA_X25519Prv.generate()
 
     shared_ab = alice_prv.exchange(bob_prv.public_key())
 
