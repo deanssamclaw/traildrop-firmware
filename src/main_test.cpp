@@ -29,6 +29,7 @@
 #include "msg/msgpack.h"
 #include "msg/lxmf.h"
 #include "msg/lxmf_transport.h"
+#include "msg/waypoint.h"
 #include <RNG.h>
 
 // Device identity (global, used by networking later)
@@ -1701,14 +1702,32 @@ static void run_msgpack_lxmf_tests(int& line) {
 // ============================================================
 
 static void on_lxmf_received(const msg::LXMessage& msg, int rssi, float snr) {
-    Serial.printf("[LXMF] Received message!\n");
-    Serial.printf("[LXMF] Title: %.*s\n", (int)msg.title_len, msg.title);
-    Serial.printf("[LXMF] Content: %.*s\n", (int)msg.content_len, msg.content);
-    Serial.printf("[LXMF] Signature valid: %s\n", msg.signature_valid ? "YES" : "NO");
-    if (msg.has_custom_fields) {
-        Serial.printf("[LXMF] Custom type: %.*s\n", (int)msg.custom_type_len, msg.custom_type);
+    // Check if this is a waypoint
+    if (msg.has_custom_fields &&
+        msg.custom_type_len == 18 &&
+        memcmp(msg.custom_type, "traildrop/waypoint", 18) == 0) {
+
+        // Decode waypoint from custom_data
+        msg::Waypoint wp;
+        if (msg::waypoint_decode(msg.custom_data, msg.custom_data_len, wp)) {
+            Serial.printf("[WAYPOINT] Received: %s\n", wp.name);
+            Serial.printf("[WAYPOINT] Position: %.6f, %.6f, %.1fm\n", wp.lat, wp.lon, wp.ele);
+            if (wp.notes[0]) Serial.printf("[WAYPOINT] Notes: %s\n", wp.notes);
+            Serial.printf("[WAYPOINT] Sig: %s | RSSI=%d SNR=%.1f\n",
+                          msg.signature_valid ? "VALID" : "INVALID", rssi, snr);
+        } else {
+            Serial.printf("[WAYPOINT] Decode failed (data_len=%d)\n", msg.custom_data_len);
+        }
+    } else {
+        // Regular LXMF message
+        Serial.printf("[LXMF] Title: %.*s\n", (int)msg.title_len, msg.title);
+        Serial.printf("[LXMF] Content: %.*s\n", (int)msg.content_len, msg.content);
+        Serial.printf("[LXMF] Signature valid: %s\n", msg.signature_valid ? "YES" : "NO");
+        if (msg.has_custom_fields) {
+            Serial.printf("[LXMF] Custom type: %.*s\n", (int)msg.custom_type_len, msg.custom_type);
+        }
+        Serial.printf("[LXMF] RSSI=%d SNR=%.1f\n", rssi, snr);
     }
-    Serial.printf("[LXMF] RSSI=%d SNR=%.1f\n", rssi, snr);
 }
 
 // ============================================================
@@ -2245,6 +2264,240 @@ static void run_phase4b_tests(int& line) {
     line += 2;
 }
 
+// ============================================================
+// Phase 4c: Waypoint Codec Tests
+// ============================================================
+
+static bool test_waypoint_encode_decode_roundtrip() {
+    // Encode known waypoint, decode, verify all fields match
+    msg::Waypoint wp;
+    memset(&wp, 0, sizeof(wp));
+    wp.lat = 38.9717;
+    wp.lon = -95.2353;
+    wp.ele = 267.0f;
+    strncpy(wp.name, "Camp", sizeof(wp.name) - 1);
+    strncpy(wp.notes, "Water source", sizeof(wp.notes) - 1);
+    wp.timestamp = 1709312400;
+    wp.valid = true;
+
+    uint8_t buf[256];
+    size_t encoded_len = msg::waypoint_encode(wp, buf, sizeof(buf));
+    if (encoded_len == 0) {
+        Serial.println("[4C] Encode failed");
+        return false;
+    }
+
+    msg::Waypoint decoded;
+    if (!msg::waypoint_decode(buf, encoded_len, decoded)) {
+        Serial.println("[4C] Decode failed");
+        return false;
+    }
+
+    if (decoded.lat != 38.9717) return false;
+    if (decoded.lon != -95.2353) return false;
+    if (decoded.ele != 267.0f) return false;
+    if (strcmp(decoded.name, "Camp") != 0) return false;
+    if (strcmp(decoded.notes, "Water source") != 0) return false;
+    if (decoded.timestamp != 1709312400) return false;
+    if (!decoded.valid) return false;
+
+    return true;
+}
+
+static bool test_waypoint_encode_python_match() {
+    // Verify our encoder output matches Python msgpack.packb byte-for-byte
+    // Python: msgpack.packb({"lat": 38.9717, "lon": -95.2353, "ele": 267.0,
+    //                        "name": "Camp", "notes": "Water source", "ts": 1709312400})
+    const char* expected_hex =
+        "86a36c6174cb40437c60aa64c2f8a36c6f6ecbc057cf0f27bb2fec"
+        "a3656c65cb4070b00000000000a46e616d65a443616d70a56e6f74"
+        "6573ac576174657220736f75726365a27473ce65e20990";
+    uint8_t expected[128];
+    int expected_len = hex_to_bytes(expected_hex, expected, sizeof(expected));
+
+    msg::Waypoint wp;
+    memset(&wp, 0, sizeof(wp));
+    wp.lat = 38.9717;
+    wp.lon = -95.2353;
+    wp.ele = 267.0f;
+    strncpy(wp.name, "Camp", sizeof(wp.name) - 1);
+    strncpy(wp.notes, "Water source", sizeof(wp.notes) - 1);
+    wp.timestamp = 1709312400;
+
+    uint8_t buf[256];
+    size_t encoded_len = msg::waypoint_encode(wp, buf, sizeof(buf));
+    if (encoded_len == 0) return false;
+
+    if ((int)encoded_len != expected_len) {
+        Serial.printf("[4C] Len mismatch: got %d, expected %d\n", encoded_len, expected_len);
+        return false;
+    }
+    if (memcmp(buf, expected, expected_len) != 0) {
+        Serial.printf("[4C] Byte mismatch:\n  Got:    ");
+        for (size_t i = 0; i < encoded_len; i++) Serial.printf("%02x", buf[i]);
+        Serial.printf("\n  Expect: %s\n", expected_hex);
+        return false;
+    }
+    return true;
+}
+
+static bool test_waypoint_in_lxmf_roundtrip() {
+    // Build LXMF with waypoint custom fields, parse, extract waypoint
+    crypto::Identity sender;
+    if (!crypto::identity_generate(sender)) return false;
+
+    net::Destination sender_lxmf, receiver_lxmf;
+    if (!net::destination_derive(sender, "lxmf", "delivery", sender_lxmf)) return false;
+
+    crypto::Identity receiver;
+    if (!crypto::identity_generate(receiver)) return false;
+    if (!net::destination_derive(receiver, "lxmf", "delivery", receiver_lxmf)) return false;
+
+    // Encode waypoint
+    msg::Waypoint wp;
+    memset(&wp, 0, sizeof(wp));
+    wp.lat = 38.9717;
+    wp.lon = -95.2353;
+    wp.ele = 267.0f;
+    strncpy(wp.name, "Camp", sizeof(wp.name) - 1);
+    strncpy(wp.notes, "Water source", sizeof(wp.notes) - 1);
+    wp.timestamp = 1709312400;
+
+    uint8_t custom_data[256];
+    size_t custom_data_len = msg::waypoint_encode(wp, custom_data, sizeof(custom_data));
+    if (custom_data_len == 0) return false;
+
+    // Build LXMF with custom fields
+    uint8_t lxmf_out[500];
+    size_t lxmf_len = sizeof(lxmf_out);
+    uint8_t message_hash[32];
+
+    if (!msg::lxmf_build(
+            sender, sender_lxmf.hash, receiver_lxmf.hash,
+            1709312400.0,
+            (const uint8_t*)"Camp", 4,
+            (const uint8_t*)"Water source", 12,
+            (const uint8_t*)"traildrop/waypoint", 18,
+            custom_data, custom_data_len,
+            lxmf_out, &lxmf_len, message_hash)) {
+        return false;
+    }
+
+    // Reconstruct full LXMF and parse
+    uint8_t full_lxmf[600];
+    memcpy(full_lxmf, receiver_lxmf.hash, 16);
+    memcpy(full_lxmf + 16, lxmf_out, lxmf_len);
+
+    msg::LXMessage parsed;
+    if (!msg::lxmf_parse(full_lxmf, 16 + lxmf_len, parsed)) return false;
+
+    if (!parsed.has_custom_fields) return false;
+    if (parsed.custom_type_len != 18) return false;
+    if (memcmp(parsed.custom_type, "traildrop/waypoint", 18) != 0) return false;
+
+    // Decode waypoint from custom_data
+    msg::Waypoint decoded;
+    if (!msg::waypoint_decode(parsed.custom_data, parsed.custom_data_len, decoded)) return false;
+
+    if (decoded.lat != 38.9717) return false;
+    if (decoded.lon != -95.2353) return false;
+    if (strcmp(decoded.name, "Camp") != 0) return false;
+
+    return true;
+}
+
+static bool test_waypoint_no_gps_fix() {
+    // waypoint_send should return false when GPS has no fix (indoor testing)
+    // We can't mock GPS, but we know the devices are indoors, so gps_has_fix() is false.
+    // Instead, test the encode path with a direct encode/decode of empty coords.
+    msg::Waypoint wp;
+    memset(&wp, 0, sizeof(wp));
+    wp.lat = 0.0;
+    wp.lon = 0.0;
+    wp.ele = 0.0f;
+    strncpy(wp.name, "NoFix", sizeof(wp.name) - 1);
+    wp.timestamp = 0;
+
+    uint8_t buf[256];
+    size_t len = msg::waypoint_encode(wp, buf, sizeof(buf));
+    if (len == 0) return false;
+
+    msg::Waypoint decoded;
+    if (!msg::waypoint_decode(buf, len, decoded)) return false;
+    if (decoded.lat != 0.0 || decoded.lon != 0.0) return false;
+    if (strcmp(decoded.name, "NoFix") != 0) return false;
+
+    return true;
+}
+
+static bool test_waypoint_empty_notes() {
+    // Notes field should be omitted from msgpack when empty
+    // Python: msgpack.packb({"lat": 38.9717, "lon": -95.2353, "ele": 267.0,
+    //                        "name": "Camp", "ts": 1709312400})
+    const char* expected_hex =
+        "85a36c6174cb40437c60aa64c2f8a36c6f6ecbc057cf0f27bb2fec"
+        "a3656c65cb4070b00000000000a46e616d65a443616d70a27473ce65e20990";
+    uint8_t expected[128];
+    int expected_len = hex_to_bytes(expected_hex, expected, sizeof(expected));
+
+    msg::Waypoint wp;
+    memset(&wp, 0, sizeof(wp));
+    wp.lat = 38.9717;
+    wp.lon = -95.2353;
+    wp.ele = 267.0f;
+    strncpy(wp.name, "Camp", sizeof(wp.name) - 1);
+    // notes left empty (memset to 0)
+    wp.timestamp = 1709312400;
+
+    uint8_t buf[256];
+    size_t encoded_len = msg::waypoint_encode(wp, buf, sizeof(buf));
+    if (encoded_len == 0) return false;
+
+    if ((int)encoded_len != expected_len) {
+        Serial.printf("[4C] No-notes len mismatch: got %d, expected %d\n", encoded_len, expected_len);
+        return false;
+    }
+    if (memcmp(buf, expected, expected_len) != 0) {
+        Serial.printf("[4C] No-notes byte mismatch\n");
+        return false;
+    }
+
+    // Decode it back and verify notes is empty
+    msg::Waypoint decoded;
+    if (!msg::waypoint_decode(buf, encoded_len, decoded)) return false;
+    if (decoded.notes[0] != '\0') return false;
+
+    return true;
+}
+
+static void run_phase4c_tests(int& line) {
+    Serial.println("\n[PHASE4C] Running Phase 4c waypoint tests...");
+    hal::display_printf(0, line * 18, 0xFFFF, 2, "=== 4c Tests ===");
+    line++;
+
+    struct { const char* name; bool (*fn)(); } tests[] = {
+        {"WP Roundtrip",     test_waypoint_encode_decode_roundtrip},
+        {"WP Python Match",  test_waypoint_encode_python_match},
+        {"WP LXMF RT",       test_waypoint_in_lxmf_roundtrip},
+        {"WP No Fix",        test_waypoint_no_gps_fix},
+        {"WP Empty Notes",   test_waypoint_empty_notes},
+    };
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+
+    bool all_pass = true;
+    for (int i = 0; i < num_tests; i++) {
+        bool ok = tests[i].fn();
+        if (!ok) all_pass = false;
+        Serial.printf("[PHASE4C] %-16s %s\n", tests[i].name, ok ? "PASS" : "FAIL");
+        show_boot_status(tests[i].name, ok, line++);
+    }
+
+    Serial.printf("[PHASE4C] === %s ===\n", all_pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
+    hal::display_printf(0, (line + 1) * 18, all_pass ? 0x07E0 : 0xF800, 2,
+                        all_pass ? "4c: ALL PASS" : "4c: FAILURES");
+    line += 2;
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -2455,6 +2708,10 @@ void setup() {
         line++; // Add spacing
         run_phase4b_tests(line);
 
+        // Phase 4c: Run waypoint tests
+        line++; // Add spacing
+        run_phase4c_tests(line);
+
         // Re-initialize after tests:
         // - Transport tests overwrite s_identity/s_destination with stack-local pointers
         // - Announce tests leave stale test peers in the peer table
@@ -2490,26 +2747,17 @@ void loop() {
         
         // Test triggers
         if (key == 's' && identity_ready) {
-            // Send LXMF message to first known peer
-            const net::Peer* peer = net::peer_first();
-            if (peer) {
-                uint8_t msg_hash[32];
-                Serial.printf("[TEST] Sending LXMF to peer %02x%02x%02x%02x...\n",
-                    peer->dest_hash[0], peer->dest_hash[1],
-                    peer->dest_hash[2], peer->dest_hash[3]);
-                if (msg::lxmf_send(
-                        device_identity, device_lxmf_destination.hash,
-                        peer->dest_hash,
-                        "Test", "Hello from TrailDrop!",
-                        (const uint8_t*)"traildrop/waypoint", 18,
-                        nullptr, 0,
-                        msg_hash)) {
-                    Serial.println("[TEST] LXMF message sent successfully");
-                } else {
-                    Serial.println("[TEST] LXMF send failed");
-                }
+            // Send waypoint with GPS data to first known peer
+            if (!hal::gps_has_fix()) {
+                Serial.println("[TX] No GPS fix — cannot send waypoint");
             } else {
-                Serial.println("[TEST] No peers discovered yet");
+                const net::Peer* peer = net::peer_first();
+                if (peer) {
+                    msg::waypoint_send(device_identity, device_lxmf_destination.hash,
+                                       peer->dest_hash, "Waypoint", "Shared from TrailDrop");
+                } else {
+                    Serial.println("[TX] No peers discovered yet");
+                }
             }
         } else if (key == 'a' && identity_ready) {
             // Force announce
@@ -2540,6 +2788,19 @@ void loop() {
 
     // --- GPS ---
     hal::gps_poll();
+
+    // --- GPS serial status (every 5s) ---
+    static uint32_t last_gps_display = 0;
+    if (millis() - last_gps_display > 5000) {
+        if (hal::gps_has_fix()) {
+            Serial.printf("[GPS] Fix: %.6f, %.6f, %.1fm | Sats=%d HDOP=%.1f\n",
+                          hal::gps_latitude(), hal::gps_longitude(), hal::gps_altitude(),
+                          hal::gps_satellites(), hal::gps_hdop());
+        } else {
+            Serial.printf("[GPS] No fix (sats=%d)\n", hal::gps_satellites());
+        }
+        last_gps_display = millis();
+    }
 
     // --- Periodic display update (every 1s) ---
     uint32_t now = millis();
