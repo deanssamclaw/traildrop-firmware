@@ -196,6 +196,10 @@ bool announce_process(const Packet& pkt) {
     memcpy(&signed_data[signed_len], &pkt.payload[74], 10);  // random_hash
     signed_len += 10;
 
+    // Bounds check app_data_len against remaining buffer capacity
+    size_t max_app_data = sizeof(signed_data) - signed_len;
+    if (app_data_len > max_app_data) return false;
+
     if (app_data_len > 0) {
         memcpy(&signed_data[signed_len], &pkt.payload[148], app_data_len);
         signed_len += app_data_len;
@@ -210,7 +214,7 @@ bool announce_process(const Packet& pkt) {
     char display_name[DISPLAY_NAME_MAX] = {0};
     if (app_data_len > 0) {
         const uint8_t* raw = &pkt.payload[148];
-        if (raw[0] >= 0x90 && raw[0] <= 0x9f) {
+        if ((raw[0] >= 0x90 && raw[0] <= 0x9f) || raw[0] == 0xdc) {
             // LXMF 0.5.0+ format: msgpack fixarray — decode [display_name_bytes, ...]
             msg::Decoder dec(raw, app_data_len);
             uint8_t arr_count = dec.read_array();
