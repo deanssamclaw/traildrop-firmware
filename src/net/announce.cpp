@@ -13,7 +13,7 @@ bool announce_build(const crypto::Identity& id,
                     const char* app_data,
                     Packet& out_pkt) {
     // Compute full_name for name_hash
-    char full_name[128];
+    char full_name[130];  // max: 64 app_name + 1 dot + 64 aspects + 1 null
     snprintf(full_name, sizeof(full_name), "%s.%s", dest.app_name, dest.aspects);
     
     // Compute name_hash = SHA-256(full_name)[0:10]
@@ -166,7 +166,9 @@ bool announce_process(const Packet& pkt) {
     }
     
     // Build signed_data for verification
-    uint8_t signed_data[16 + 64 + 10 + 10 + DISPLAY_NAME_MAX];
+    // Buffer sized to max INPUT (not output) — signature covers full app_data before truncation
+    // Max app_data from wire: RNS_MAX_PAYLOAD_H1 - 148 = 333 bytes
+    uint8_t signed_data[16 + 64 + 10 + 10 + (RNS_MAX_PAYLOAD_H1 - 148)];
     size_t signed_len = 0;
     
     memcpy(&signed_data[signed_len], pkt.dest_hash, 16);
