@@ -35,6 +35,8 @@ uint32_t transport_rx_count();
 uint32_t transport_tx_count();
 
 // Callback type for received data packets addressed to us
+// Note: Reticulum HEADER_1 DATA packets don't carry sender identity.
+// sender_dest_hash is nullptr — sender attribution requires link-layer features (Phase 4+).
 typedef void (*data_callback_t)(const uint8_t* sender_dest_hash,
                                  const uint8_t* data, size_t data_len);
 

@@ -68,6 +68,13 @@ bool transport_send_data(const uint8_t peer_dest_hash[DEST_HASH_SIZE],
     memset(peer_id.ed25519_private, 0, 32);
     peer_id.valid = true;
     
+    // Validate data fits after encryption overhead (32 ephemeral + 16 IV + data + padding + 32 HMAC)
+    const size_t max_data_len = RNS_MAX_PAYLOAD_H1 - 80;  // ~401 bytes
+    if (data_len > max_data_len) {
+        Serial.printf("[TX] ERROR: Data too large (%d > %d)\n", (int)data_len, (int)max_data_len);
+        return false;
+    }
+    
     // Encrypt payload for the peer
     uint8_t encrypted[RNS_MTU];
     size_t enc_len = 0;
@@ -136,8 +143,9 @@ void transport_poll() {
                     Serial.printf("[RX] DATA decrypted: %d bytes\n", dec_len);
                     
                     // Call callback if registered
+                    // Note: sender is nullptr — H1 DATA packets don't carry sender identity
                     if (s_data_callback != nullptr) {
-                        s_data_callback(pkt.dest_hash, decrypted, dec_len);
+                        s_data_callback(nullptr, decrypted, dec_len);
                     }
                 } else {
                     Serial.println("[RX] DATA decryption failed");

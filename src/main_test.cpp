@@ -1262,10 +1262,15 @@ void setup() {
         
         // Register data callback
         net::transport_on_data([](const uint8_t* sender, const uint8_t* data, size_t len) {
-            Serial.printf("[DATA] Received %d bytes from ", len);
-            for (int i = 0; i < 4; i++) Serial.printf("%02x", sender[i]);
-            Serial.printf("...\n");
-            // Print data as string if printable
+            Serial.printf("[DATA] Received %d bytes", len);
+            if (sender) {
+                Serial.printf(" from ");
+                for (int i = 0; i < 4; i++) Serial.printf("%02x", sender[i]);
+                Serial.printf("...");
+            } else {
+                Serial.printf(" (sender unknown)");
+            }
+            Serial.println();
             Serial.printf("[DATA] Content: %.*s\n", (int)len, (const char*)data);
         });
         
