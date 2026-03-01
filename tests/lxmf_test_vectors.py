@@ -17,6 +17,11 @@ def to_hex(data):
 
 
 def main():
+    # Initialize RNS (required for Destination registration)
+    import tempfile, os
+    tmpdir = tempfile.mkdtemp()
+    RNS.Reticulum(configdir=tmpdir, loglevel=RNS.LOG_CRITICAL)
+
     vectors = {}
 
     # =====================================================================
