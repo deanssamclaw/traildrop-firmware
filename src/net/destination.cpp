@@ -10,7 +10,7 @@ bool destination_derive(const crypto::Identity& id,
                         const char* aspects,
                         Destination& dest) {
     // Build full_name = "app_name.aspects"
-    char full_name[128];
+    char full_name[130];  // max: 64 app_name + 1 dot + 64 aspects + 1 null
     snprintf(full_name, sizeof(full_name), "%s.%s", app_name, aspects);
     
     // Delegate to crypto layer (correct two-step hash process)

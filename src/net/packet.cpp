@@ -93,8 +93,12 @@ bool packet_deserialize(const uint8_t* raw, size_t raw_len, Packet& pkt) {
     // Read context
     pkt.context = raw[offset++];
     
-    // Read payload (remaining bytes)
+    // Read payload (remaining bytes) — bounds-check to prevent buffer overflow
     pkt.payload_len = raw_len - offset;
+    size_t max_payload = pkt.has_transport ? RNS_MAX_PAYLOAD_H2 : RNS_MAX_PAYLOAD_H1;
+    if (pkt.payload_len > max_payload) {
+        return false;  // Reject oversized payload
+    }
     if (pkt.payload_len > 0) {
         memcpy(pkt.payload, raw + offset, pkt.payload_len);
     }
@@ -109,6 +113,13 @@ void packet_hash(const uint8_t* raw, size_t raw_len, bool is_header2,
     // For HEADER_2: skip hops + transport_id (1 + 16 = 17 bytes), include dest_hash + context + payload
     
     size_t skip_offset = is_header2 ? 18 : 2;  // HEADER_2: skip 1+1+16=18, HEADER_1: skip 1+1=2
+    
+    // Input validation — prevent underflow on size_t subtraction
+    if (raw_len < skip_offset) {
+        memset(out_hash, 0, 32);
+        memset(out_truncated, 0, 16);
+        return;
+    }
     size_t hashable_len = 1 + (raw_len - skip_offset);  // 1 byte for masked flags + remaining
     
     // Allocate buffer for hashable part
