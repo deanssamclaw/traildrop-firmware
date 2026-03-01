@@ -32,7 +32,8 @@
 
 // Device identity (global, used by networking later)
 static crypto::Identity device_identity;
-static net::Destination device_destination;
+static net::Destination device_destination;       // traildrop.waypoint
+static net::Destination device_lxmf_destination;  // lxmf.delivery (Phase 4a.5)
 static bool identity_ready = false;
 
 // Wire compat test: auto-send test message after discovering a peer
@@ -759,9 +760,13 @@ static bool test_announce_build_valid_payload() {
     if (pkt.get_destination_type() != DEST_SINGLE) return false;
     if (pkt.get_header_type() != HEADER_1) return false;
     
-    // Verify payload length (148 minimum + app_data)
-    size_t expected_len = 148 + strlen("TestNode");
+    // Verify payload length: 148 base + msgpack([b"TestNode", null])
+    // msgpack: 0x92 + 0xc4 0x08 + "TestNode"(8) + 0xc0 = 12 bytes
+    size_t expected_len = 148 + 12;
     if (pkt.payload_len != expected_len) return false;
+
+    // Verify app_data starts with 0x92 (fixarray of 2)
+    if (pkt.payload[148] != 0x92) return false;
     
     // Verify public keys in payload
     if (memcmp(&pkt.payload[0], id.x25519_public, 32) != 0) return false;
@@ -1690,6 +1695,307 @@ static void run_msgpack_lxmf_tests(int& line) {
     line += 2;
 }
 
+// ============================================================
+// Phase 4a.5: Announce Migration + Dual Destination Tests
+// ============================================================
+
+static bool test_announce_app_data_msgpack() {
+    // Verify announce_build encodes app_data as msgpack [name_bytes, null]
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+
+    net::Destination dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest)) return false;
+
+    Packet pkt;
+    if (!net::announce_build(id, dest, "TrailDrop", pkt)) return false;
+
+    // app_data starts at offset 148
+    if (pkt.payload_len <= 148) return false;
+
+    // First byte must be 0x92 (fixarray of 2)
+    if (pkt.payload[148] != 0x92) {
+        Serial.printf("[4A5] Expected 0x92, got 0x%02x\n", pkt.payload[148]);
+        return false;
+    }
+
+    // Decode the app_data and verify display name
+    size_t ad_len = pkt.payload_len - 148;
+    msg::Decoder dec(&pkt.payload[148], ad_len);
+    uint8_t arr_count = dec.read_array();
+    if (dec.error || arr_count != 2) return false;
+
+    // First element: bin "TrailDrop"
+    uint8_t name_buf[32];
+    size_t name_len = dec.read_bin(name_buf, sizeof(name_buf));
+    if (dec.error || name_len != 9) return false;
+    if (memcmp(name_buf, "TrailDrop", 9) != 0) return false;
+
+    // Second element: nil
+    dec.read_nil();
+    if (dec.error) return false;
+
+    return true;
+}
+
+static bool test_announce_app_data_python_match() {
+    // Verify our encoding matches Python: msgpack.packb([b"TrailDrop", None])
+    // Expected from test vectors: 92c409547261696c44726f70c0
+    const char* expected_hex = "92c409547261696c44726f70c0";
+    uint8_t expected[16];
+    int expected_len = hex_to_bytes(expected_hex, expected, sizeof(expected));
+
+    // Encode using our encoder
+    uint8_t buf[32];
+    msg::Encoder enc(buf, sizeof(buf));
+    enc.write_array(2);
+    enc.write_bin((const uint8_t*)"TrailDrop", 9);
+    enc.write_nil();
+
+    if (enc.error) return false;
+    if ((int)enc.pos != expected_len) {
+        Serial.printf("[4A5] App data len mismatch: got %d, expected %d\n", enc.pos, expected_len);
+        return false;
+    }
+    if (memcmp(buf, expected, expected_len) != 0) {
+        Serial.printf("[4A5] App data bytes mismatch\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_announce_decode_legacy_format() {
+    // Simulate receiving a legacy announce with raw UTF-8 app_data
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+
+    net::Destination dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest)) return false;
+
+    // Manually build a legacy-format announce packet (raw string app_data)
+    Packet pkt;
+    // Build name_hash
+    uint8_t name_full_hash[32];
+    crypto::sha256((const uint8_t*)"traildrop.waypoint", 18, name_full_hash);
+    uint8_t name_hash[10];
+    memcpy(name_hash, name_full_hash, 10);
+
+    uint8_t random_hash[10];
+    RNG.rand(random_hash, 10);
+
+    const char* legacy_name = "OldNode";
+    size_t legacy_len = strlen(legacy_name);
+
+    // Build signed_data (same as announce_build but with raw app_data)
+    uint8_t signed_data[16 + 64 + 10 + 10 + 32];
+    size_t signed_len = 0;
+    memcpy(&signed_data[signed_len], dest.hash, 16); signed_len += 16;
+    memcpy(&signed_data[signed_len], id.x25519_public, 32); signed_len += 32;
+    memcpy(&signed_data[signed_len], id.ed25519_public, 32); signed_len += 32;
+    memcpy(&signed_data[signed_len], name_hash, 10); signed_len += 10;
+    memcpy(&signed_data[signed_len], random_hash, 10); signed_len += 10;
+    memcpy(&signed_data[signed_len], legacy_name, legacy_len); signed_len += legacy_len;
+
+    uint8_t signature[64];
+    if (!crypto::identity_sign(id, signed_data, signed_len, signature)) return false;
+
+    // Assemble payload
+    size_t offset = 0;
+    memcpy(&pkt.payload[offset], id.x25519_public, 32); offset += 32;
+    memcpy(&pkt.payload[offset], id.ed25519_public, 32); offset += 32;
+    memcpy(&pkt.payload[offset], name_hash, 10); offset += 10;
+    memcpy(&pkt.payload[offset], random_hash, 10); offset += 10;
+    memcpy(&pkt.payload[offset], signature, 64); offset += 64;
+    memcpy(&pkt.payload[offset], legacy_name, legacy_len); offset += legacy_len;
+    pkt.payload_len = offset;
+
+    pkt.set_flags(HEADER_1, false, TRANSPORT_BROADCAST, DEST_SINGLE, PKT_ANNOUNCE);
+    pkt.hops = 0;
+    pkt.has_transport = false;
+    memcpy(pkt.dest_hash, dest.hash, DEST_HASH_SIZE);
+    pkt.context = CTX_NONE;
+
+    net::peer_table_init();
+    if (!net::announce_process(pkt)) return false;
+
+    const net::Peer* peer = net::peer_lookup(dest.hash);
+    if (peer == nullptr) return false;
+
+    // Legacy app_data should be decoded as raw string
+    if (strcmp(peer->app_data, "OldNode") != 0) {
+        Serial.printf("[4A5] Legacy decode: got '%s'\n", peer->app_data);
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_announce_decode_msgpack_format() {
+    // Build announce with new format, process it, verify display name is decoded
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+
+    net::Destination dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest)) return false;
+
+    Packet pkt;
+    if (!net::announce_build(id, dest, "NewNode", pkt)) return false;
+
+    net::peer_table_init();
+    if (!net::announce_process(pkt)) return false;
+
+    const net::Peer* peer = net::peer_lookup(dest.hash);
+    if (peer == nullptr) return false;
+
+    if (strcmp(peer->app_data, "NewNode") != 0) {
+        Serial.printf("[4A5] Msgpack decode: got '%s'\n", peer->app_data);
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_dual_dest_computation() {
+    // Use known test vector keys and verify both dest hashes match Python
+    crypto::Identity id;
+    hex_to_bytes("387b35263170015ac008c58a9755350e28f541843a0acb58a142199858ec4e6b",
+                 id.x25519_private, 32);
+    hex_to_bytes("338298dec0eeb458587f5792cac3dd70e0e73699a17a2362d00ab3868ba6b313",
+                 id.x25519_public, 32);
+    hex_to_bytes("258494ef78f67f7197cd0a52933b72657a346b8792a14ee0f7093a8175441968",
+                 id.ed25519_private, 32);
+    hex_to_bytes("bcf6af73c182888032960d55f0679c43f7bf7667594743254cef72532cbdc213",
+                 id.ed25519_public, 32);
+    hex_to_bytes("cc4e2bc21134c415f4d685016a443914", id.hash, 16);
+    id.valid = true;
+
+    // Compute traildrop.waypoint
+    net::Destination td_dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", td_dest)) return false;
+
+    uint8_t expected_td[16];
+    hex_to_bytes("e3e523376aec31c62d40e0e894e247c7", expected_td, 16);
+    if (memcmp(td_dest.hash, expected_td, 16) != 0) {
+        Serial.printf("[4A5] TD dest mismatch: ");
+        for (int i = 0; i < 16; i++) Serial.printf("%02x", td_dest.hash[i]);
+        Serial.println();
+        return false;
+    }
+
+    // Compute lxmf.delivery
+    net::Destination lxmf_dest;
+    if (!net::destination_derive(id, "lxmf", "delivery", lxmf_dest)) return false;
+
+    uint8_t expected_lxmf[16];
+    hex_to_bytes("b32367e2bddccefe0b15b6f5c957676c", expected_lxmf, 16);
+    if (memcmp(lxmf_dest.hash, expected_lxmf, 16) != 0) {
+        Serial.printf("[4A5] LXMF dest mismatch: ");
+        for (int i = 0; i < 16; i++) Serial.printf("%02x", lxmf_dest.hash[i]);
+        Serial.println();
+        return false;
+    }
+
+    // Verify they're different
+    if (memcmp(td_dest.hash, lxmf_dest.hash, 16) == 0) return false;
+
+    return true;
+}
+
+static bool test_peer_lxmf_dest_hash() {
+    // After processing an announce, verify peer has correct lxmf.delivery dest_hash
+    crypto::Identity id;
+    hex_to_bytes("387b35263170015ac008c58a9755350e28f541843a0acb58a142199858ec4e6b",
+                 id.x25519_private, 32);
+    hex_to_bytes("338298dec0eeb458587f5792cac3dd70e0e73699a17a2362d00ab3868ba6b313",
+                 id.x25519_public, 32);
+    hex_to_bytes("258494ef78f67f7197cd0a52933b72657a346b8792a14ee0f7093a8175441968",
+                 id.ed25519_private, 32);
+    hex_to_bytes("bcf6af73c182888032960d55f0679c43f7bf7667594743254cef72532cbdc213",
+                 id.ed25519_public, 32);
+    hex_to_bytes("cc4e2bc21134c415f4d685016a443914", id.hash, 16);
+    id.valid = true;
+
+    net::Destination dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest)) return false;
+
+    Packet pkt;
+    if (!net::announce_build(id, dest, "TrailDrop", pkt)) return false;
+
+    net::peer_table_init();
+    if (!net::announce_process(pkt)) return false;
+
+    const net::Peer* peer = net::peer_lookup(dest.hash);
+    if (peer == nullptr) return false;
+
+    // Verify lxmf_dest_hash matches Python test vector
+    uint8_t expected_lxmf[16];
+    hex_to_bytes("b32367e2bddccefe0b15b6f5c957676c", expected_lxmf, 16);
+    if (memcmp(peer->lxmf_dest_hash, expected_lxmf, 16) != 0) {
+        Serial.printf("[4A5] Peer LXMF dest mismatch: ");
+        for (int i = 0; i < 16; i++) Serial.printf("%02x", peer->lxmf_dest_hash[i]);
+        Serial.printf("\n  Expected: ");
+        for (int i = 0; i < 16; i++) Serial.printf("%02x", expected_lxmf[i]);
+        Serial.println();
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_dual_dest_different() {
+    // For a random identity, verify both dests are computed and different
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+
+    net::Destination td_dest, lxmf_dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", td_dest)) return false;
+    if (!net::destination_derive(id, "lxmf", "delivery", lxmf_dest)) return false;
+
+    // Must be different
+    if (memcmp(td_dest.hash, lxmf_dest.hash, 16) == 0) return false;
+
+    // Both must be non-zero
+    bool td_zero = true, lxmf_zero = true;
+    for (int i = 0; i < 16; i++) {
+        if (td_dest.hash[i] != 0) td_zero = false;
+        if (lxmf_dest.hash[i] != 0) lxmf_zero = false;
+    }
+    if (td_zero || lxmf_zero) return false;
+
+    return true;
+}
+
+static void run_phase4a5_tests(int& line) {
+    Serial.println("\n[PHASE4A5] Running Phase 4a.5 announce migration tests...");
+    hal::display_printf(0, line * 18, 0xFFFF, 2, "=== 4a.5 Tests ===");
+    line++;
+
+    struct { const char* name; bool (*fn)(); } tests[] = {
+        {"AppData Msgpack",  test_announce_app_data_msgpack},
+        {"AppData PyMatch",  test_announce_app_data_python_match},
+        {"Decode Legacy",    test_announce_decode_legacy_format},
+        {"Decode Msgpack",   test_announce_decode_msgpack_format},
+        {"Dual Dest Vec",    test_dual_dest_computation},
+        {"Peer LXMF Dest",  test_peer_lxmf_dest_hash},
+        {"Dual Dest Diff",   test_dual_dest_different},
+    };
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+
+    bool all_pass = true;
+    for (int i = 0; i < num_tests; i++) {
+        bool ok = tests[i].fn();
+        if (!ok) all_pass = false;
+        Serial.printf("[PHASE4A5] %-16s %s\n", tests[i].name, ok ? "PASS" : "FAIL");
+        show_boot_status(tests[i].name, ok, line++);
+    }
+
+    Serial.printf("[PHASE4A5] === %s ===\n", all_pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
+    hal::display_printf(0, (line + 1) * 18, all_pass ? 0x07E0 : 0xF800, 2,
+                        all_pass ? "4a.5: ALL PASS" : "4a.5: FAILURES");
+    line += 2;
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -1812,20 +2118,23 @@ void setup() {
             }
         }
         
-        // Derive destination
-        if (net::destination_derive(device_identity, APP_NAME, "waypoint", device_destination)) {
+        // Derive destinations (Phase 4a.5: dual destinations)
+        if (net::destination_derive(device_identity, APP_NAME, "waypoint", device_destination) &&
+            net::destination_derive(device_identity, "lxmf", "delivery", device_lxmf_destination)) {
             identity_ready = true;
-            
+
             // Print identity info
             Serial.printf("[ID] Identity hash: ");
             for (int i = 0; i < 16; i++) Serial.printf("%02x", device_identity.hash[i]);
             Serial.println();
-            Serial.printf("[ID] Destination:   ");
+            Serial.printf("[ID] TD Dest:       ");
             for (int i = 0; i < 16; i++) Serial.printf("%02x", device_destination.hash[i]);
+            Serial.println();
+            Serial.printf("[ID] LXMF Dest:     ");
+            for (int i = 0; i < 16; i++) Serial.printf("%02x", device_lxmf_destination.hash[i]);
             Serial.println();
 
             // Dump full identity key bytes for wire compat test capture
-            // Format: x25519_prv(32) + x25519_pub(32) + ed25519_prv(32) + ed25519_pub(32)
             uint8_t id_bytes[128];
             memcpy(id_bytes, device_identity.x25519_private, 32);
             memcpy(id_bytes + 32, device_identity.x25519_public, 32);
@@ -1834,7 +2143,7 @@ void setup() {
             Serial.print("[ID_KEY] ");
             for (int i = 0; i < 128; i++) Serial.printf("%02x", id_bytes[i]);
             Serial.println();
-            
+
             // Show on display
             hal::display_printf(0, line * 18, 0x07FF, 1, "ID: %02x%02x%02x%02x...",
                 device_identity.hash[0], device_identity.hash[1],
@@ -1872,7 +2181,7 @@ void setup() {
         });
         
         // Send initial announce
-        net::transport_announce(APP_NAME);
+        net::transport_announce("TrailDrop");
         Serial.println("[NET] Transport initialized, announce sent");
     }
 
@@ -1899,6 +2208,10 @@ void setup() {
         line++; // Add spacing
         run_msgpack_lxmf_tests(line);
 
+        // Phase 4a.5: Run announce migration + dual dest tests
+        line++; // Add spacing
+        run_phase4a5_tests(line);
+
         // Re-initialize after tests:
         // - Transport tests overwrite s_identity/s_destination with stack-local pointers
         // - Announce tests leave stale test peers in the peer table
@@ -1907,7 +2220,7 @@ void setup() {
             net::transport_init(device_identity, device_destination);
             // Re-announce after tests — boot announce was likely lost while
             // the other device was also running self-tests
-            net::transport_announce(APP_NAME);
+            net::transport_announce("TrailDrop");
             Serial.println("[NET] Post-test re-announce sent");
         }
     } else {
@@ -1949,7 +2262,7 @@ void loop() {
             }
         } else if (key == 'a' && identity_ready) {
             // Force announce
-            net::transport_announce(APP_NAME);
+            net::transport_announce("TrailDrop");
         }
         
         if (key_pos < (int)sizeof(last_keys) - 1) {
@@ -2017,7 +2330,7 @@ void loop() {
         static uint32_t last_announce_check = 0;
         if (now - last_announce_check >= (ANNOUNCE_INTERVAL * 1000UL)) {
             last_announce_check = now;
-            net::transport_announce(APP_NAME);
+            net::transport_announce("TrailDrop");
         }
     }
     if (now - last_display_update >= 1000) {
