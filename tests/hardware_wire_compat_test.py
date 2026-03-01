@@ -655,49 +655,58 @@ def main():
     print(f"  Device A: {DEVICE_A_PORT}")
     print(f"  Device B: {DEVICE_B_PORT}")
 
-    # Reset both devices
-    print("\nResetting both devices...")
-    reset_device(ser_a)
+    # Staggered reset: Boot Device B (receiver) first, wait for it to enter
+    # the main loop and be ready to receive, then reset Device A (sender).
+    # This ensures Device A's announce arrives when Device B is listening.
+    print("\nResetting Device B (receiver) first...")
     reset_device(ser_b)
-
-    # Wait for boot
-    print("Waiting for boot (15s)...")
-    time.sleep(15)
-
-    # Drain boot output
-    boot_a = drain_and_collect(ser_a, timeout=3)
+    print("Waiting for Device B to boot and enter main loop (25s)...")
+    time.sleep(25)
     boot_b = drain_and_collect(ser_b, timeout=3)
-    print(f"  Device A: {len(boot_a)} lines of boot output")
     print(f"  Device B: {len(boot_b)} lines of boot output")
-
-    # Check that devices booted with identity
-    a_ready = any("[NET]" in l for l in boot_a)
-    b_ready = any("[NET]" in l for l in boot_b)
-    if not a_ready:
-        print("  WARN: Device A may not have network initialized")
+    b_ready = any("[NET]" in l or "Entering main loop" in l for l in boot_b)
     if not b_ready:
         print("  WARN: Device B may not have network initialized")
 
-    # Extract and cache identity keys from boot output ([ID_KEY] lines)
+    # Extract and cache Device B identity key
     identity_cache_dir = os.path.join(os.path.dirname(__file__), ".identity_cache")
     os.makedirs(identity_cache_dir, exist_ok=True)
+    for line in boot_b:
+        if "[ID_KEY]" in line:
+            hex_key = line.split("[ID_KEY]")[-1].strip()
+            try:
+                key_bytes = bytes.fromhex(hex_key)
+                if len(key_bytes) == 128:
+                    cache_path = os.path.join(identity_cache_dir, "device_b_identity.dat")
+                    with open(cache_path, "wb") as f:
+                        f.write(key_bytes)
+                    print(f"  Cached Device B identity key")
+            except ValueError:
+                pass
 
-    for label, boot_lines, cache_name in [
-        ("Device A", boot_a, "device_a_identity.dat"),
-        ("Device B", boot_b, "device_b_identity.dat"),
-    ]:
-        for line in boot_lines:
-            if "[ID_KEY]" in line:
-                hex_key = line.split("[ID_KEY]")[-1].strip()
-                try:
-                    key_bytes = bytes.fromhex(hex_key)
-                    if len(key_bytes) == 128:
-                        cache_path = os.path.join(identity_cache_dir, cache_name)
-                        with open(cache_path, "wb") as f:
-                            f.write(key_bytes)
-                        print(f"  Cached {label} identity key ({cache_path})")
-                except ValueError:
-                    pass
+    print("\nNow resetting Device A (sender)...")
+    reset_device(ser_a)
+    print("Waiting for Device A to boot (25s)...")
+    time.sleep(25)
+    boot_a = drain_and_collect(ser_a, timeout=3)
+    print(f"  Device A: {len(boot_a)} lines of boot output")
+    a_ready = any("[NET]" in l or "Entering main loop" in l for l in boot_a)
+    if not a_ready:
+        print("  WARN: Device A may not have network initialized")
+
+    # Extract and cache Device A identity key
+    for line in boot_a:
+        if "[ID_KEY]" in line:
+            hex_key = line.split("[ID_KEY]")[-1].strip()
+            try:
+                key_bytes = bytes.fromhex(hex_key)
+                if len(key_bytes) == 128:
+                    cache_path = os.path.join(identity_cache_dir, "device_a_identity.dat")
+                    with open(cache_path, "wb") as f:
+                        f.write(key_bytes)
+                    print(f"  Cached Device A identity key")
+            except ValueError:
+                pass
 
     # Run tests
     announce = test_2a_announce_capture(ser_a, ser_b)
