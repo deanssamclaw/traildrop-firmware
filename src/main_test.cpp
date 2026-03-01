@@ -1423,5 +1423,8 @@ void loop() {
             "Up: %lus               ", now / 1000);
     }
 
+    // Stir RNG entropy pool — required for RNG.rand() to work after boot
+    RNG.loop();
+
     delay(20); // ~50Hz poll rate
 }
