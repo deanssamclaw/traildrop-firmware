@@ -1297,6 +1297,12 @@ void setup() {
         // Phase 3d: Run transport tests
         line++; // Add spacing
         run_transport_tests(line);
+        
+        // Re-initialize transport with real device identity/destination
+        // (transport tests overwrite s_identity/s_destination with stack-local pointers)
+        if (identity_ready && boot.radio) {
+            net::transport_init(device_identity, device_destination);
+        }
     } else {
         Serial.println("[CRYPTO] Skipping crypto tests - SD card required");
         hal::display_printf(0, line * 18, 0xFBE0, 2, "Crypto: SKIP (no SD)");
