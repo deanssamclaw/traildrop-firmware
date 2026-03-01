@@ -96,6 +96,14 @@
 #define DERIVED_KEY_LENGTH  64    // HKDF output for Token (signing + encryption)
 #define ANNOUNCE_INTERVAL   300   // Seconds between announces (5 min)
 
+// Wire format constants (Phase 3a)
+#define RNS_HEADER1_SIZE      19   // HEADER_1 overhead
+#define RNS_HEADER2_SIZE      35   // HEADER_2 overhead
+#define RNS_MAX_PAYLOAD_H1   481   // MTU - HEADER_1
+#define RNS_MAX_PAYLOAD_H2   465   // MTU - HEADER_2
+#define RNS_HASH_LENGTH       32   // Full SHA-256
+#define RNS_TRUNCATED_HASH    16   // Truncated hash (128 bits) — same value as DEST_HASH_SIZE
+
 // ============================================================
 // Application
 // ============================================================

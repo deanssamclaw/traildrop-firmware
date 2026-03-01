@@ -20,6 +20,7 @@
 #include "crypto/identity.h"
 #include "crypto/encrypt.h"
 #include "crypto/token.h"
+#include "net/packet.h"
 #include <RNG.h>
 
 // Boot health tracking — single source of truth for init results
@@ -399,6 +400,288 @@ static void run_crypto_tests(int& line) {
     line += 2;
 }
 
+// ============================================================
+// Phase 3a: Packet Wire Format Tests
+// ============================================================
+
+static bool test_flags_construction() {
+    Packet pkt;
+    
+    // Test 1: HEADER_1, BROADCAST, SINGLE, DATA → 0x00
+    pkt.set_flags(HEADER_1, false, TRANSPORT_BROADCAST, DEST_SINGLE, PKT_DATA);
+    if (pkt.flags != 0x00) return false;
+    if (pkt.get_header_type() != HEADER_1) return false;
+    if (pkt.get_packet_type() != PKT_DATA) return false;
+    
+    // Test 2: HEADER_1, BROADCAST, SINGLE, ANNOUNCE → 0x01
+    pkt.set_flags(HEADER_1, false, TRANSPORT_BROADCAST, DEST_SINGLE, PKT_ANNOUNCE);
+    if (pkt.flags != 0x01) return false;
+    if (pkt.get_packet_type() != PKT_ANNOUNCE) return false;
+    
+    // Test 3: HEADER_2, TRANSPORT, SINGLE, DATA → 0x50
+    pkt.set_flags(HEADER_2, false, TRANSPORT_TRANSPORT, DEST_SINGLE, PKT_DATA);
+    if (pkt.flags != 0x50) return false;
+    if (pkt.get_header_type() != HEADER_2) return false;
+    if (pkt.get_transport_type() != TRANSPORT_TRANSPORT) return false;
+    
+    // Test 4: HEADER_1, BROADCAST, LINK, PROOF → 0x0F
+    pkt.set_flags(HEADER_1, false, TRANSPORT_BROADCAST, DEST_LINK, PKT_PROOF);
+    if (pkt.flags != 0x0F) return false;
+    if (pkt.get_destination_type() != DEST_LINK) return false;
+    if (pkt.get_packet_type() != PKT_PROOF) return false;
+    
+    return true;
+}
+
+static bool test_header1_roundtrip() {
+    Packet pkt;
+    pkt.set_flags(HEADER_1, false, TRANSPORT_BROADCAST, DEST_SINGLE, PKT_DATA);
+    pkt.hops = 5;
+    pkt.has_transport = false;
+    for (int i = 0; i < 16; i++) pkt.dest_hash[i] = i;
+    pkt.context = 0x00;
+    const char* msg = "Hello TrailDrop";
+    pkt.payload_len = strlen(msg);
+    memcpy(pkt.payload, msg, pkt.payload_len);
+    
+    uint8_t buf[RNS_MTU];
+    int len = net::packet_serialize(pkt, buf, sizeof(buf));
+    if (len < 0) return false;
+    
+    Packet pkt2;
+    if (!net::packet_deserialize(buf, len, pkt2)) return false;
+    
+    // Verify all fields match
+    if (pkt2.flags != pkt.flags) return false;
+    if (pkt2.hops != pkt.hops) return false;
+    if (pkt2.has_transport != pkt.has_transport) return false;
+    if (memcmp(pkt2.dest_hash, pkt.dest_hash, 16) != 0) return false;
+    if (pkt2.context != pkt.context) return false;
+    if (pkt2.payload_len != pkt.payload_len) return false;
+    if (memcmp(pkt2.payload, pkt.payload, pkt.payload_len) != 0) return false;
+    
+    return true;
+}
+
+static bool test_header2_roundtrip() {
+    Packet pkt;
+    pkt.set_flags(HEADER_2, false, TRANSPORT_TRANSPORT, DEST_SINGLE, PKT_DATA);
+    pkt.hops = 3;
+    pkt.has_transport = true;
+    for (int i = 0; i < 16; i++) {
+        pkt.transport_id[i] = i + 0x10;
+        pkt.dest_hash[i] = i + 0x20;
+    }
+    pkt.context = 0x01;
+    const char* msg = "Test with transport";
+    pkt.payload_len = strlen(msg);
+    memcpy(pkt.payload, msg, pkt.payload_len);
+    
+    uint8_t buf[RNS_MTU];
+    int len = net::packet_serialize(pkt, buf, sizeof(buf));
+    if (len < 0) return false;
+    
+    Packet pkt2;
+    if (!net::packet_deserialize(buf, len, pkt2)) return false;
+    
+    // Verify all fields match
+    if (pkt2.flags != pkt.flags) return false;
+    if (pkt2.hops != pkt.hops) return false;
+    if (pkt2.has_transport != pkt.has_transport) return false;
+    if (memcmp(pkt2.transport_id, pkt.transport_id, 16) != 0) return false;
+    if (memcmp(pkt2.dest_hash, pkt.dest_hash, 16) != 0) return false;
+    if (pkt2.context != pkt.context) return false;
+    if (pkt2.payload_len != pkt.payload_len) return false;
+    if (memcmp(pkt2.payload, pkt.payload, pkt.payload_len) != 0) return false;
+    
+    return true;
+}
+
+static bool test_header1_packet_hash() {
+    Packet pkt;
+    pkt.set_flags(HEADER_1, false, TRANSPORT_BROADCAST, DEST_SINGLE, PKT_ANNOUNCE);
+    pkt.hops = 0x03;
+    pkt.has_transport = false;
+    for (int i = 0; i < 16; i++) pkt.dest_hash[i] = i;
+    pkt.context = 0x00;
+    const char* msg = "test_payload_data";
+    pkt.payload_len = strlen(msg);
+    memcpy(pkt.payload, msg, pkt.payload_len);
+    
+    uint8_t buf[RNS_MTU];
+    int len = net::packet_serialize(pkt, buf, sizeof(buf));
+    if (len < 0) return false;
+    
+    uint8_t hash[32];
+    uint8_t truncated[16];
+    net::packet_hash(buf, len, false, hash, truncated);
+    
+    // Expected full hash from test vector
+    const uint8_t expected_full[32] = {
+        0x84, 0xdb, 0xe6, 0xcd, 0x02, 0x86, 0x40, 0x2b,
+        0x42, 0x1e, 0x6c, 0x72, 0xe1, 0xdb, 0xa3, 0xb6,
+        0x0a, 0x57, 0x0f, 0xad, 0x27, 0x66, 0x08, 0x62,
+        0x93, 0xd4, 0xa2, 0xaf, 0x5c, 0x7b, 0x43, 0x58,
+    };
+    
+    // Expected truncated (first 16 bytes)
+    const uint8_t expected_trunc[16] = {
+        0x84, 0xdb, 0xe6, 0xcd, 0x02, 0x86, 0x40, 0x2b,
+        0x42, 0x1e, 0x6c, 0x72, 0xe1, 0xdb, 0xa3, 0xb6,
+    };
+    
+    if (memcmp(hash, expected_full, 32) != 0) return false;
+    if (memcmp(truncated, expected_trunc, 16) != 0) return false;
+    
+    return true;
+}
+
+static bool test_header2_hash_strips_transport() {
+    // Create HEADER_2 packet with transport_id
+    Packet pkt2;
+    pkt2.set_flags(HEADER_2, false, TRANSPORT_TRANSPORT, DEST_SINGLE, PKT_DATA);
+    pkt2.hops = 7;
+    pkt2.has_transport = true;
+    for (int i = 0; i < 16; i++) {
+        pkt2.transport_id[i] = 0xAA;  // Different transport
+        pkt2.dest_hash[i] = i;
+    }
+    pkt2.context = 0x00;
+    const char* msg = "same payload";
+    pkt2.payload_len = strlen(msg);
+    memcpy(pkt2.payload, msg, pkt2.payload_len);
+    
+    // Create HEADER_1 packet with same logical content
+    Packet pkt1;
+    pkt1.set_flags(HEADER_1, false, TRANSPORT_BROADCAST, DEST_SINGLE, PKT_DATA);
+    pkt1.hops = 3;  // Different hops
+    pkt1.has_transport = false;
+    memcpy(pkt1.dest_hash, pkt2.dest_hash, 16);
+    pkt1.context = pkt2.context;
+    pkt1.payload_len = pkt2.payload_len;
+    memcpy(pkt1.payload, pkt2.payload, pkt2.payload_len);
+    
+    uint8_t buf1[RNS_MTU], buf2[RNS_MTU];
+    int len1 = net::packet_serialize(pkt1, buf1, sizeof(buf1));
+    int len2 = net::packet_serialize(pkt2, buf2, sizeof(buf2));
+    if (len1 < 0 || len2 < 0) return false;
+    
+    uint8_t hash1[32], hash2[32];
+    uint8_t trunc1[16], trunc2[16];
+    net::packet_hash(buf1, len1, false, hash1, trunc1);
+    net::packet_hash(buf2, len2, true, hash2, trunc2);
+    
+    // Should produce SAME truncated hash (transport metadata stripped)
+    return memcmp(trunc1, trunc2, 16) == 0;
+}
+
+static bool test_max_payload_enforcement() {
+    Packet pkt;
+    uint8_t buf[RNS_MTU];
+    
+    // HEADER_1 with payload_len > 481 should fail
+    pkt.has_transport = false;
+    pkt.payload_len = 482;
+    if (net::packet_serialize(pkt, buf, sizeof(buf)) != -1) return false;
+    
+    // HEADER_2 with payload_len > 465 should fail
+    pkt.has_transport = true;
+    pkt.payload_len = 466;
+    if (net::packet_serialize(pkt, buf, sizeof(buf)) != -1) return false;
+    
+    return true;
+}
+
+static bool test_deserialize_rejects_undersized() {
+    Packet pkt;
+    uint8_t buf[10] = {0};
+    
+    // 10 bytes is too small for any valid packet
+    if (net::packet_deserialize(buf, 10, pkt)) return false;
+    
+    return true;
+}
+
+static bool test_empty_payload() {
+    Packet pkt;
+    pkt.set_flags(HEADER_1, false, TRANSPORT_BROADCAST, DEST_SINGLE, PKT_DATA);
+    pkt.hops = 0;
+    pkt.has_transport = false;
+    for (int i = 0; i < 16; i++) pkt.dest_hash[i] = i;
+    pkt.context = 0x00;
+    pkt.payload_len = 0;
+    
+    uint8_t buf[RNS_MTU];
+    int len = net::packet_serialize(pkt, buf, sizeof(buf));
+    if (len != 19) return false;  // Exactly HEADER_1 size
+    
+    Packet pkt2;
+    if (!net::packet_deserialize(buf, len, pkt2)) return false;
+    if (pkt2.payload_len != 0) return false;
+    
+    return true;
+}
+
+static bool test_exact_max_payload() {
+    Packet pkt;
+    uint8_t buf[RNS_MTU];
+    
+    // HEADER_1 with exactly 481 bytes should succeed
+    pkt.has_transport = false;
+    pkt.payload_len = 481;
+    for (size_t i = 0; i < 481; i++) pkt.payload[i] = (uint8_t)i;
+    int len = net::packet_serialize(pkt, buf, sizeof(buf));
+    if (len != 500) return false;
+    
+    // HEADER_1 with 482 bytes should fail
+    pkt.payload_len = 482;
+    if (net::packet_serialize(pkt, buf, sizeof(buf)) != -1) return false;
+    
+    // HEADER_2 with exactly 465 bytes should succeed
+    pkt.has_transport = true;
+    pkt.payload_len = 465;
+    len = net::packet_serialize(pkt, buf, sizeof(buf));
+    if (len != 500) return false;
+    
+    // HEADER_2 with 466 bytes should fail
+    pkt.payload_len = 466;
+    if (net::packet_serialize(pkt, buf, sizeof(buf)) != -1) return false;
+    
+    return true;
+}
+
+static void run_packet_tests(int& line) {
+    Serial.println("\n[PACKET] Running Phase 3a packet tests...");
+    hal::display_printf(0, line * 18, 0xFFFF, 2, "=== Packet Tests ===");
+    line++;
+
+    struct { const char* name; bool (*fn)(); } tests[] = {
+        {"Flags Construct",  test_flags_construction},
+        {"H1 Roundtrip",     test_header1_roundtrip},
+        {"H2 Roundtrip",     test_header2_roundtrip},
+        {"H1 Hash Vector",   test_header1_packet_hash},
+        {"H2 Hash Strips",   test_header2_hash_strips_transport},
+        {"Max Payload",      test_max_payload_enforcement},
+        {"Reject Undersize", test_deserialize_rejects_undersized},
+        {"Empty Payload",    test_empty_payload},
+        {"Exact Max Bound",  test_exact_max_payload},
+    };
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+
+    bool all_pass = true;
+    for (int i = 0; i < num_tests; i++) {
+        bool ok = tests[i].fn();
+        if (!ok) all_pass = false;
+        Serial.printf("[PACKET] %-16s %s\n", tests[i].name, ok ? "PASS" : "FAIL");
+        show_boot_status(tests[i].name, ok, line++);
+    }
+
+    Serial.printf("[PACKET] === %s ===\n", all_pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
+    hal::display_printf(0, (line + 1) * 18, all_pass ? 0x07E0 : 0xF800, 2,
+                        all_pass ? "Packet: ALL PASS" : "Packet: FAILURES");
+    line += 2;
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -506,6 +789,10 @@ void setup() {
     if (boot.storage) {
         line++; // Add spacing
         run_crypto_tests(line);
+        
+        // Phase 3a: Run packet tests
+        line++; // Add spacing
+        run_packet_tests(line);
     } else {
         Serial.println("[CRYPTO] Skipping crypto tests - SD card required");
         hal::display_printf(0, line * 18, 0xFBE0, 2, "Crypto: SKIP (no SD)");
