@@ -30,6 +30,7 @@
 #include "msg/lxmf.h"
 #include "msg/lxmf_transport.h"
 #include "msg/waypoint.h"
+#include "ui/display_ui.h"
 #include <RNG.h>
 
 // Device identity (global, used by networking later)
@@ -1715,6 +1716,10 @@ static void on_lxmf_received(const msg::LXMessage& msg, int rssi, float snr) {
             if (wp.notes[0]) Serial.printf("[WAYPOINT] Notes: %s\n", wp.notes);
             Serial.printf("[WAYPOINT] Sig: %s | RSSI=%d SNR=%.1f\n",
                           msg.signature_valid ? "VALID" : "INVALID", rssi, snr);
+
+            // Notify display UI
+            const net::Peer* sender = net::peer_lookup_by_lxmf_dest(msg.source_hash);
+            ui::ui_on_waypoint_received(wp, sender ? sender->app_data : "Unknown", rssi);
         } else {
             Serial.printf("[WAYPOINT] Decode failed (data_len=%d)\n", msg.custom_data_len);
         }
@@ -2731,61 +2736,15 @@ void setup() {
     }
 
     Serial.println("[BOOT] === Entering main loop ===\n");
-    hal::display_printf(0, (line + 1) * 18, 0x07E0, 2, "Ready. Looping...");
+
+    // Phase 4d: Initialize display UI (shows boot screen, then transitions to main)
+    ui::ui_init();
+    if (identity_ready) {
+        ui::ui_set_send_context(&device_identity, device_lxmf_destination.hash);
+    }
 }
 
 void loop() {
-    static uint32_t last_display_update = 0;
-    static int cursor_x = 160, cursor_y = 120;
-    static char last_keys[32] = {0};
-    static int key_pos = 0;
-
-    // --- Keyboard ---
-    char key = hal::keyboard_read();
-    if (key) {
-        Serial.printf("[KB] Key: 0x%02X '%c'\n", key, (key >= 32 && key < 127) ? key : '.');
-        
-        // Test triggers
-        if (key == 's' && identity_ready) {
-            // Send waypoint with GPS data to first known peer
-            if (!hal::gps_has_fix()) {
-                Serial.println("[TX] No GPS fix — cannot send waypoint");
-            } else {
-                const net::Peer* peer = net::peer_first();
-                if (peer) {
-                    msg::waypoint_send(device_identity, device_lxmf_destination.hash,
-                                       peer->dest_hash, "Waypoint", "Shared from TrailDrop");
-                } else {
-                    Serial.println("[TX] No peers discovered yet");
-                }
-            }
-        } else if (key == 'a' && identity_ready) {
-            // Force announce
-            net::transport_announce("TrailDrop");
-        }
-        
-        if (key_pos < (int)sizeof(last_keys) - 1) {
-            last_keys[key_pos++] = (key >= 32 && key < 127) ? key : '.';
-            last_keys[key_pos] = '\0';
-        } else {
-            // Shift buffer left
-            memmove(last_keys, last_keys + 1, sizeof(last_keys) - 1);
-            last_keys[sizeof(last_keys) - 2] = (key >= 32 && key < 127) ? key : '.';
-        }
-    }
-
-    // --- Trackball ---
-    int8_t dx = 0, dy = 0;
-    bool click = false;
-    hal::trackball_read(dx, dy, click);
-    if (dx || dy || click) {
-        cursor_x += dx * 4;
-        cursor_y += dy * 4;
-        cursor_x = constrain(cursor_x, 0, DISPLAY_WIDTH - 1);
-        cursor_y = constrain(cursor_y, 0, DISPLAY_HEIGHT - 1);
-        Serial.printf("[TB] dx=%d dy=%d click=%d pos=(%d,%d)\n", dx, dy, click, cursor_x, cursor_y);
-    }
-
     // --- GPS ---
     hal::gps_poll();
 
@@ -2802,7 +2761,6 @@ void loop() {
         last_gps_display = millis();
     }
 
-    // --- Periodic display update (every 1s) ---
     uint32_t now = millis();
 
     // --- Network polling (Phase 4b: LXMF transport replaces raw transport_poll) ---
@@ -2818,7 +2776,7 @@ void loop() {
         if (after_peers > before_peers && !auto_send_pending) {
             auto_send_pending = true;
             auto_send_time = now + 30000;  // 30 seconds from now
-            Serial.printf("[AUTO] Peer discovered (count %d→%d), will send LXMF in 30s\n",
+            Serial.printf("[AUTO] Peer discovered (count %d->%d), will send LXMF in 30s\n",
                           before_peers, after_peers);
         }
         prev_peer_count = after_peers;
@@ -2850,51 +2808,13 @@ void loop() {
             last_announce_check = now;
             net::transport_announce("TrailDrop");
         }
+
+        // Feed peer count to UI
+        ui::ui_set_peer_count(after_peers);
     }
-    if (now - last_display_update >= 1000) {
-        last_display_update = now;
 
-        // Clear the live data area (bottom half of screen)
-        int y_start = 200;
-
-        // Network status
-        if (identity_ready) {
-            hal::display_printf(0, y_start - 72, 0x07FF, 1,
-                "Net: TX=%lu RX=%lu Peers=%d   ",
-                net::transport_tx_count(), msg::lxmf_rx_count(),
-                net::peer_count());
-        }
-
-        // GPS line
-        if (hal::gps_has_fix()) {
-            hal::display_printf(0, y_start - 60, 0x07E0, 1,
-                "GPS: %.6f, %.6f  %dm  %dsat  ",
-                hal::gps_latitude(), hal::gps_longitude(),
-                (int)hal::gps_altitude(), hal::gps_satellites());
-        } else {
-            hal::display_printf(0, y_start - 60, 0xFBE0, 1,
-                "GPS: no fix  %d sat       ",
-                hal::gps_satellites());
-        }
-
-        // Battery
-        hal::display_printf(0, y_start - 48, 0xFFE0, 1,
-            "Bat: %.2fV %d%% %s    ",
-            hal::battery_voltage(), hal::battery_percent(),
-            hal::battery_is_low() ? "LOW!" : "");
-
-        // Trackball cursor
-        hal::display_printf(0, y_start - 36, 0xBDF7, 1,
-            "Cursor: %d, %d          ", cursor_x, cursor_y);
-
-        // Keyboard buffer
-        hal::display_printf(0, y_start - 24, 0xFFFF, 1,
-            "Keys: %s              ", last_keys);
-
-        // Uptime
-        hal::display_printf(0, y_start - 12, 0x7BEF, 1,
-            "Up: %lus               ", now / 1000);
-    }
+    // --- Phase 4d: Display UI handles all screen drawing + keyboard input ---
+    ui::ui_update();
 
     // Stir RNG entropy pool — required for RNG.rand() to work after boot
     RNG.loop();
