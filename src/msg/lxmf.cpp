@@ -20,7 +20,7 @@ bool lxmf_build(
 )
 {
     // Step 1: Pack payload array [timestamp, title, content, fields]
-    uint8_t packed_payload[512];
+    uint8_t packed_payload[700];
     Encoder enc(packed_payload, sizeof(packed_payload));
 
     enc.write_array(4);
@@ -43,7 +43,7 @@ bool lxmf_build(
 
     // Step 2: Compute message hash
     // hashed_part = dest_hash(16) + source_hash(16) + packed_payload
-    uint8_t hashed_part[544];
+    uint8_t hashed_part[732]; // 32 + 700
     memcpy(hashed_part, dest_hash, 16);
     memcpy(hashed_part + 16, source_dest_hash, 16);
     memcpy(hashed_part + 32, packed_payload, payload_len);
@@ -53,7 +53,7 @@ bool lxmf_build(
 
     // Step 3: Compute signature
     // signed_part = hashed_part + message_hash
-    uint8_t signed_part[576];
+    uint8_t signed_part[764]; // 732 + 32
     memcpy(signed_part, hashed_part, hashed_part_len);
     memcpy(signed_part + hashed_part_len, message_hash, 32);
     size_t signed_part_len = hashed_part_len + 32;
@@ -66,6 +66,9 @@ bool lxmf_build(
     // Step 4: Assemble output for opportunistic delivery
     // source_hash(16) + signature(64) + packed_payload
     size_t total = 16 + 64 + payload_len;
+
+    // Verify output fits in caller's buffer (max RNS encrypted payload ~383 bytes)
+    if (total > 500) return false;  // Sanity check: can't exceed MTU
     *out_len = total;
 
     memcpy(out, source_dest_hash, 16);
@@ -90,6 +93,9 @@ bool lxmf_parse(
 
     const uint8_t* raw_payload = lxmf_data + 96;
     size_t raw_payload_len = lxmf_len - 96;
+
+    // Bounds check: payload must fit in packed_payload buffer
+    if (raw_payload_len > sizeof(msg.packed_payload)) return false;
 
     // Step 2: Check array element count and handle stamp stripping
     Decoder check(raw_payload, raw_payload_len);
@@ -153,7 +159,7 @@ bool lxmf_parse(
 
     // Step 4: Compute message hash
     // hashed_part = dest_hash + source_hash + packed_payload (4-element)
-    uint8_t hashed_part[544];
+    uint8_t hashed_part[732]; // 32 + 700
     memcpy(hashed_part, msg.dest_hash, 16);
     memcpy(hashed_part + 16, msg.source_hash, 16);
     memcpy(hashed_part + 32, msg.packed_payload, msg.packed_payload_len);
@@ -171,7 +177,7 @@ bool lxmf_verify(
 )
 {
     // signed_part = dest_hash + source_hash + packed_payload + message_hash
-    uint8_t signed_part[576];
+    uint8_t signed_part[764]; // 732 + 32
     size_t pos = 0;
 
     memcpy(signed_part, msg.dest_hash, 16);

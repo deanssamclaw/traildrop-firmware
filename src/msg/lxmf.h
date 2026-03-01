@@ -37,7 +37,8 @@ struct LXMessage {
     bool signature_valid;
 
     // Raw 4-element packed payload bytes (after stamp stripping if needed)
-    uint8_t packed_payload[512];
+    // Max: array(1) + float64(9) + bin8(2+64) + bin8(3+280) + map(1+2*(2+3+256)) = ~625
+    uint8_t packed_payload[700];
     size_t packed_payload_len;
 };
 
