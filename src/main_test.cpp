@@ -23,6 +23,8 @@
 #include "crypto/token.h"
 #include "net/packet.h"
 #include "net/destination.h"
+#include "net/peer.h"
+#include "net/announce.h"
 #include <RNG.h>
 
 // Device identity (global, used by networking later)
@@ -731,10 +733,272 @@ static void run_packet_tests(int& line) {
     line += 2;
 }
 
+// ============================================================
+// Phase 3c: Announce and Peer Table Tests
+// ============================================================
+
+static bool test_announce_build_valid_payload() {
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+    
+    net::Destination dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest)) return false;
+    
+    Packet pkt;
+    if (!net::announce_build(id, dest, "TestNode", pkt)) return false;
+    
+    // Verify packet flags
+    if (pkt.get_packet_type() != PKT_ANNOUNCE) return false;
+    if (pkt.get_destination_type() != DEST_SINGLE) return false;
+    if (pkt.get_header_type() != HEADER_1) return false;
+    
+    // Verify payload length (148 minimum + app_data)
+    size_t expected_len = 148 + strlen("TestNode");
+    if (pkt.payload_len != expected_len) return false;
+    
+    // Verify public keys in payload
+    if (memcmp(&pkt.payload[0], id.x25519_public, 32) != 0) return false;
+    if (memcmp(&pkt.payload[32], id.ed25519_public, 32) != 0) return false;
+    
+    return true;
+}
+
+static bool test_announce_roundtrip() {
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+    
+    net::Destination dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest)) return false;
+    
+    Packet pkt;
+    if (!net::announce_build(id, dest, "Alice", pkt)) return false;
+    
+    net::peer_table_init();
+    
+    if (!net::announce_process(pkt)) return false;
+    
+    const net::Peer* peer = net::peer_lookup(dest.hash);
+    if (peer == nullptr) return false;
+    
+    if (memcmp(peer->x25519_public, id.x25519_public, 32) != 0) return false;
+    if (strcmp(peer->app_data, "Alice") != 0) return false;
+    
+    return true;
+}
+
+static bool test_announce_wrong_signature_fails() {
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+    
+    net::Destination dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest)) return false;
+    
+    Packet pkt;
+    if (!net::announce_build(id, dest, "Bob", pkt)) return false;
+    
+    // Corrupt one byte of the signature (at offset 84)
+    pkt.payload[84] ^= 0xFF;
+    
+    net::peer_table_init();
+    
+    // Should fail signature verification
+    if (net::announce_process(pkt)) return false;
+    
+    return true;
+}
+
+static bool test_announce_wrong_dest_hash_fails() {
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+    
+    net::Destination dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest)) return false;
+    
+    Packet pkt;
+    if (!net::announce_build(id, dest, "Carol", pkt)) return false;
+    
+    // Corrupt dest_hash
+    pkt.dest_hash[0] ^= 0xFF;
+    
+    net::peer_table_init();
+    
+    // Should fail dest hash verification
+    if (net::announce_process(pkt)) return false;
+    
+    return true;
+}
+
+static bool test_peer_table_store_lookup() {
+    net::peer_table_init();
+    
+    uint8_t dest_hash[DEST_HASH_SIZE];
+    uint8_t x25519[32];
+    uint8_t ed25519[32];
+    uint8_t id_hash[DEST_HASH_SIZE];
+    
+    for (int i = 0; i < DEST_HASH_SIZE; i++) dest_hash[i] = i;
+    for (int i = 0; i < 32; i++) x25519[i] = i + 0x10;
+    for (int i = 0; i < 32; i++) ed25519[i] = i + 0x20;
+    for (int i = 0; i < DEST_HASH_SIZE; i++) id_hash[i] = i + 0x30;
+    
+    if (!net::peer_store(dest_hash, x25519, ed25519, id_hash, "TestPeer")) return false;
+    
+    const net::Peer* peer = net::peer_lookup(dest_hash);
+    if (peer == nullptr) return false;
+    
+    if (memcmp(peer->dest_hash, dest_hash, DEST_HASH_SIZE) != 0) return false;
+    if (strcmp(peer->app_data, "TestPeer") != 0) return false;
+    
+    if (net::peer_count() != 1) return false;
+    
+    // Lookup with different hash should return nullptr
+    uint8_t wrong_hash[DEST_HASH_SIZE];
+    for (int i = 0; i < DEST_HASH_SIZE; i++) wrong_hash[i] = 0xFF;
+    if (net::peer_lookup(wrong_hash) != nullptr) return false;
+    
+    return true;
+}
+
+static bool test_announce_without_app_data() {
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+    
+    net::Destination dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest)) return false;
+    
+    Packet pkt;
+    if (!net::announce_build(id, dest, nullptr, pkt)) return false;
+    
+    // Should be exactly 148 bytes (no app_data)
+    if (pkt.payload_len != 148) return false;
+    
+    net::peer_table_init();
+    
+    if (!net::announce_process(pkt)) return false;
+    
+    const net::Peer* peer = net::peer_lookup(dest.hash);
+    if (peer == nullptr) return false;
+    
+    // app_data should be empty string
+    if (peer->app_data[0] != '\0') return false;
+    
+    return true;
+}
+
+static bool test_announce_payload_too_short() {
+    Packet pkt;
+    pkt.set_flags(HEADER_1, false, TRANSPORT_BROADCAST, DEST_SINGLE, PKT_ANNOUNCE);
+    pkt.payload_len = 100;  // Too short
+    
+    net::peer_table_init();
+    
+    // Should fail
+    if (net::announce_process(pkt)) return false;
+    
+    return true;
+}
+
+static bool test_announce_duplicate_updates_peer() {
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+    
+    net::Destination dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest)) return false;
+    
+    net::peer_table_init();
+    
+    // First announce
+    Packet pkt1;
+    if (!net::announce_build(id, dest, "Alice", pkt1)) return false;
+    if (!net::announce_process(pkt1)) return false;
+    
+    if (net::peer_count() != 1) return false;
+    
+    // Second announce from same identity with different app_data
+    Packet pkt2;
+    if (!net::announce_build(id, dest, "AliceV2", pkt2)) return false;
+    if (!net::announce_process(pkt2)) return false;
+    
+    // Should still be 1 peer (updated, not duplicated)
+    if (net::peer_count() != 1) return false;
+    
+    const net::Peer* peer = net::peer_lookup(dest.hash);
+    if (peer == nullptr) return false;
+    
+    // app_data should be updated
+    if (strcmp(peer->app_data, "AliceV2") != 0) return false;
+    
+    return true;
+}
+
+static bool test_peer_table_multiple_peers() {
+    net::peer_table_init();
+    
+    // Generate 3 different identities and announce them
+    crypto::Identity ids[3];
+    net::Destination dests[3];
+    const char* names[] = {"Alice", "Bob", "Carol"};
+    
+    for (int i = 0; i < 3; i++) {
+        if (!crypto::identity_generate(ids[i])) return false;
+        if (!net::destination_derive(ids[i], "traildrop", "waypoint", dests[i])) return false;
+        
+        Packet pkt;
+        if (!net::announce_build(ids[i], dests[i], names[i], pkt)) return false;
+        if (!net::announce_process(pkt)) return false;
+    }
+    
+    if (net::peer_count() != 3) return false;
+    
+    // Verify all 3 can be looked up
+    for (int i = 0; i < 3; i++) {
+        const net::Peer* peer = net::peer_lookup(dests[i].hash);
+        if (peer == nullptr) return false;
+        if (strcmp(peer->app_data, names[i]) != 0) return false;
+    }
+    
+    return true;
+}
+
+static void run_announce_tests(int& line) {
+    Serial.println("\n[ANNOUNCE] Running Phase 3c announce tests...");
+    hal::display_printf(0, line * 18, 0xFFFF, 2, "=== Announce Tests ===");
+    line++;
+
+    struct { const char* name; bool (*fn)(); } tests[] = {
+        {"Announce Build",   test_announce_build_valid_payload},
+        {"Roundtrip",        test_announce_roundtrip},
+        {"Wrong Signature",  test_announce_wrong_signature_fails},
+        {"Wrong DestHash",   test_announce_wrong_dest_hash_fails},
+        {"Peer Store/Lookup", test_peer_table_store_lookup},
+        {"No AppData",       test_announce_without_app_data},
+        {"Payload TooShort", test_announce_payload_too_short},
+        {"Duplicate Update", test_announce_duplicate_updates_peer},
+        {"Multiple Peers",   test_peer_table_multiple_peers},
+    };
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+
+    bool all_pass = true;
+    for (int i = 0; i < num_tests; i++) {
+        bool ok = tests[i].fn();
+        if (!ok) all_pass = false;
+        Serial.printf("[ANNOUNCE] %-16s %s\n", tests[i].name, ok ? "PASS" : "FAIL");
+        show_boot_status(tests[i].name, ok, line++);
+    }
+
+    Serial.printf("[ANNOUNCE] === %s ===\n", all_pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
+    hal::display_printf(0, (line + 1) * 18, all_pass ? 0x07E0 : 0xF800, 2,
+                        all_pass ? "Announce: ALL PASS" : "Announce: FAILURES");
+    line += 2;
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
     Serial.printf("\n=== TrailDrop %s — HAL Test Harness ===\n", APP_VERSION);
+    
+    // Phase 3c: Initialize peer table
+    net::peer_table_init();
 
     // Phase 1: Boot sequence (power_init MUST be first)
     boot.power = hal::power_init();
@@ -890,6 +1154,10 @@ void setup() {
         // Phase 3a: Run packet tests
         line++; // Add spacing
         run_packet_tests(line);
+        
+        // Phase 3c: Run announce tests
+        line++; // Add spacing
+        run_announce_tests(line);
     } else {
         Serial.println("[CRYPTO] Skipping crypto tests - SD card required");
         hal::display_printf(0, line * 18, 0xFBE0, 2, "Crypto: SKIP (no SD)");
