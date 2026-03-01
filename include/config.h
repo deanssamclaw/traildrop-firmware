@@ -112,3 +112,4 @@
 #define MAX_WAYPOINTS       1000
 #define MAX_PEERS           50
 #define DISPLAY_NAME_MAX    32
+#define IDENTITY_PATH       "/traildrop/identity.dat"

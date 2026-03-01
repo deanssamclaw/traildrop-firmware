@@ -7,6 +7,7 @@
 
 #include <Arduino.h>
 #include <SPI.h>
+#include <SD.h>
 #include "config.h"
 #include "hal/power.h"
 #include "hal/display.h"
@@ -21,7 +22,13 @@
 #include "crypto/encrypt.h"
 #include "crypto/token.h"
 #include "net/packet.h"
+#include "net/destination.h"
 #include <RNG.h>
+
+// Device identity (global, used by networking later)
+static crypto::Identity device_identity;
+static net::Destination device_destination;
+static bool identity_ready = false;
 
 // Boot health tracking — single source of truth for init results
 struct BootHealth {
@@ -650,6 +657,46 @@ static bool test_exact_max_payload() {
     return true;
 }
 
+static bool test_identity_dest_roundtrip() {
+    // Generate a fresh identity
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+    
+    // Derive destination
+    net::Destination dest;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest)) return false;
+    
+    // Manually compute destination hash to verify it matches
+    uint8_t expected[16];
+    crypto::identity_destination_hash("traildrop.waypoint", id, expected);
+    if (memcmp(dest.hash, expected, 16) != 0) return false;
+    
+    // Verify app_name and aspects are stored correctly
+    if (strcmp(dest.app_name, "traildrop") != 0) return false;
+    if (strcmp(dest.aspects, "waypoint") != 0) return false;
+    
+    return true;
+}
+
+static bool test_destination_consistency() {
+    // Generate identity
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+    
+    // Same identity + same app_name + same aspects → same dest_hash every time
+    net::Destination dest1, dest2;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest1)) return false;
+    if (!net::destination_derive(id, "traildrop", "waypoint", dest2)) return false;
+    if (memcmp(dest1.hash, dest2.hash, 16) != 0) return false;
+    
+    // Different aspects → different dest_hash
+    net::Destination dest3;
+    if (!net::destination_derive(id, "traildrop", "chat", dest3)) return false;
+    if (memcmp(dest1.hash, dest3.hash, 16) == 0) return false;
+    
+    return true;
+}
+
 static void run_packet_tests(int& line) {
     Serial.println("\n[PACKET] Running Phase 3a packet tests...");
     hal::display_printf(0, line * 18, 0xFFFF, 2, "=== Packet Tests ===");
@@ -665,6 +712,8 @@ static void run_packet_tests(int& line) {
         {"Reject Undersize", test_deserialize_rejects_undersized},
         {"Empty Payload",    test_empty_payload},
         {"Exact Max Bound",  test_exact_max_payload},
+        {"Dest Roundtrip",   test_identity_dest_roundtrip},
+        {"Dest Consistent",  test_destination_consistency},
     };
     int num_tests = sizeof(tests) / sizeof(tests[0]);
 
@@ -777,8 +826,56 @@ void setup() {
         boot.battery  ? "B" : "b");
     // Uppercase = OK, lowercase = failed. e.g., "PDKTGRsB" means storage failed.
 
-    if (boot.can_network()) {
-        Serial.println("[BOOT] Network-ready: radio + storage OK");
+    // Phase 3b: Identity management
+    if (boot.storage) {
+        // Ensure /traildrop directory exists
+        SD.mkdir("/traildrop");
+        
+        if (hal::storage_exists(IDENTITY_PATH)) {
+            if (crypto::identity_load(device_identity, IDENTITY_PATH)) {
+                Serial.println("[ID] Identity loaded from SD");
+            } else {
+                Serial.println("[ID] Failed to load identity, generating new");
+                if (crypto::identity_generate(device_identity)) {
+                    crypto::identity_save(device_identity, IDENTITY_PATH);
+                    Serial.println("[ID] New identity generated and saved");
+                }
+            }
+        } else {
+            if (crypto::identity_generate(device_identity)) {
+                crypto::identity_save(device_identity, IDENTITY_PATH);
+                Serial.println("[ID] New identity generated and saved");
+            } else {
+                Serial.println("[ID] CRITICAL: Failed to generate identity");
+            }
+        }
+        
+        // Derive destination
+        if (net::destination_derive(device_identity, APP_NAME, "waypoint", device_destination)) {
+            identity_ready = true;
+            
+            // Print identity info
+            Serial.printf("[ID] Identity hash: ");
+            for (int i = 0; i < 16; i++) Serial.printf("%02x", device_identity.hash[i]);
+            Serial.println();
+            Serial.printf("[ID] Destination:   ");
+            for (int i = 0; i < 16; i++) Serial.printf("%02x", device_destination.hash[i]);
+            Serial.println();
+            
+            // Show on display
+            hal::display_printf(0, line * 18, 0x07FF, 1, "ID: %02x%02x%02x%02x...",
+                device_identity.hash[0], device_identity.hash[1],
+                device_identity.hash[2], device_identity.hash[3]);
+            line++;
+        }
+    } else {
+        Serial.println("[ID] Skipping identity — no SD card");
+    }
+
+    if (boot.can_network() && identity_ready) {
+        Serial.println("[BOOT] Full network-ready: radio + storage + identity");
+    } else if (boot.can_network()) {
+        Serial.println("[BOOT] Network-partial: radio + storage OK, identity missing");
     } else {
         Serial.println("[BOOT] Network-degraded: missing radio or storage");
     }
