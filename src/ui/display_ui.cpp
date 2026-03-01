@@ -389,19 +389,24 @@ static void handle_share(char key) {
         // Send waypoint
         if (s_share_len == 0) return; // Need a name
 
+        bool sent = false;
         if (s_identity && s_our_lxmf_dest) {
             const net::Peer* peer = net::peer_first();
             if (peer) {
-                msg::waypoint_send(*s_identity, s_our_lxmf_dest,
-                                   peer->dest_hash, s_share_name, "");
+                sent = msg::waypoint_send(*s_identity, s_our_lxmf_dest,
+                                          peer->dest_hash, s_share_name, "");
                 Serial.printf("[UI] Waypoint sent: %s\n", s_share_name);
             } else {
                 Serial.println("[UI] No peers to send to");
             }
         }
 
-        s_confirm_start = millis();
-        go_to(Screen::CONFIRM);
+        if (sent) {
+            s_confirm_start = millis();
+            go_to(Screen::CONFIRM);
+        } else {
+            go_to(Screen::MAIN);
+        }
     } else if (key == KEY_BS || key == KEY_ESC) {
         if (key == KEY_BS && s_share_len > 0) {
             // Delete last character
@@ -532,9 +537,7 @@ void ui_on_waypoint_received(const msg::Waypoint& wp, const char* sender_name, i
     s_waypoints[target].received_at = millis();
     s_waypoints[target].valid = true;
 
-    // Store peer dest hash for potential future use
-    const net::Peer* peer = net::peer_lookup_by_lxmf_dest(nullptr);
-    // We don't have the LXMF source here easily, so zero it
+    // Zero peer dest — LXMF source hash not available in this callback context
     memset(s_waypoints[target].peer_dest, 0, 16);
 
     Serial.printf("[UI] Waypoint stored: %s from %s (RSSI %d)\n",
