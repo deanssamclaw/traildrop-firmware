@@ -244,11 +244,81 @@ Result: Both packets produce the SAME truncated packet hash because:
 3. Compute SHA-256 of hashable_part
 4. Return full hash and truncated (first 16 bytes)
 
+## Transport Layer
+
+### Send Flow
+
+```
+Application Data
+      ↓
+Build Packet struct
+      ↓
+transport_send(pkt)
+      ↓
+packet_serialize(pkt, buf, RNS_MTU)
+      ↓
+hal::radio_send(buf, len)
+      ↓
+LoRa Radio Transmission
+```
+
+### Receive Flow
+
+```
+LoRa Radio Reception
+      ↓
+hal::radio_receive(buf, RNS_MTU)
+      ↓
+packet_deserialize(raw, len, pkt)
+      ↓
+Dispatch by packet_type:
+  - PKT_ANNOUNCE → announce_process(pkt)
+  - PKT_DATA → decrypt if for us, call callback
+  - PKT_PROOF → match and confirm (Phase 4)
+  - PKT_LINKREQUEST → ignore (not implementing links)
+```
+
+### Periodic Announce
+
+- **Interval:** `ANNOUNCE_INTERVAL` seconds (default: 300s = 5 minutes)
+- **Trigger:** Called from main loop every `ANNOUNCE_INTERVAL` seconds
+- **Function:** `transport_announce(app_data)`
+- **Behavior:** Builds and sends an ANNOUNCE packet with device identity and destination
+
+### Packet Type Dispatch Table
+
+| Packet Type | Action | Handler |
+|-------------|--------|---------|
+| PKT_ANNOUNCE (0x01) | Process announce, update peer table | `announce_process(pkt)` |
+| PKT_DATA (0x00) | Check destination, decrypt if for us, deliver via callback | `identity_decrypt()` + callback |
+| PKT_PROOF (0x03) | Log receipt (Phase 4 implementation pending) | None (logged only) |
+| PKT_LINKREQUEST (0x02) | Ignore (links not implemented) | None |
+
+### Buffer Sizing Rule
+
+**All buffers for incoming data must be sized to maximum INPUT, not maximum output.**
+
+- Radio receive buffer: `uint8_t rx_buf[RNS_MTU]`
+- Decrypt output buffer: `uint8_t decrypted[RNS_MTU]`
+
+This ensures that the buffer can hold the maximum possible received data regardless of actual payload size.
+
+### Statistics
+
+The transport layer tracks:
+- **TX count:** Number of packets sent via `transport_send()`
+- **RX count:** Number of packets received and successfully deserialized
+
+Access via:
+- `transport_tx_count()` — returns total packets transmitted
+- `transport_rx_count()` — returns total packets received
+
 ## Reference
 
 This specification is derived from:
 - `RNS/Packet.py` — Reticulum reference implementation
 - Cal's source code analysis (Feb 2026)
 - TrailDrop Phase 3a implementation and test vectors
+- TrailDrop Phase 3d transport layer (Mar 2026)
 
 For questions or clarifications, consult the Python reference implementation source code.

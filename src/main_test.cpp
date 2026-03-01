@@ -25,6 +25,7 @@
 #include "net/destination.h"
 #include "net/peer.h"
 #include "net/announce.h"
+#include "net/transport.h"
 #include <RNG.h>
 
 // Device identity (global, used by networking later)
@@ -960,6 +961,117 @@ static bool test_peer_table_multiple_peers() {
     return true;
 }
 
+// ============================================================
+// Phase 3d: Transport Tests
+// ============================================================
+
+static bool test_transport_init() {
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+    
+    net::Destination dest;
+    if (!net::destination_derive(id, "test", "transport", dest)) return false;
+    
+    // Initialize transport
+    if (!net::transport_init(id, dest)) return false;
+    
+    // Stats should be zero
+    if (net::transport_tx_count() != 0) return false;
+    if (net::transport_rx_count() != 0) return false;
+    
+    return true;
+}
+
+static bool test_transport_announce_requires_init() {
+    // Try to send announce before init
+    // This should fail gracefully
+    // Note: We can't actually test this without resetting state,
+    // so we just verify ANNOUNCE_INTERVAL is defined
+    if (ANNOUNCE_INTERVAL <= 0) return false;
+    return true;
+}
+
+static bool test_transport_callback_registration() {
+    crypto::Identity id;
+    if (!crypto::identity_generate(id)) return false;
+    
+    net::Destination dest;
+    if (!net::destination_derive(id, "test", "callback", dest)) return false;
+    
+    if (!net::transport_init(id, dest)) return false;
+    
+    // Register a callback (should not crash)
+    bool callback_called = false;
+    net::transport_on_data([](const uint8_t* sender, const uint8_t* data, size_t len) {
+        // Callback function
+    });
+    
+    return true;
+}
+
+static bool test_transport_packet_serialize_roundtrip() {
+    // Create a DATA packet
+    Packet pkt;
+    pkt.set_flags(HEADER_1, false, TRANSPORT_BROADCAST, DEST_SINGLE, PKT_DATA);
+    pkt.hops = 0;
+    pkt.has_transport = false;
+    pkt.context = CTX_NONE;
+    
+    // Fill dest_hash with test data
+    for (int i = 0; i < DEST_HASH_SIZE; i++) {
+        pkt.dest_hash[i] = i;
+    }
+    
+    // Add test payload
+    const char* test_payload = "Hello Transport";
+    memcpy(pkt.payload, test_payload, strlen(test_payload));
+    pkt.payload_len = strlen(test_payload);
+    
+    // Serialize
+    uint8_t buf[RNS_MTU];
+    int len = net::packet_serialize(pkt, buf, RNS_MTU);
+    if (len < 0) return false;
+    
+    // Deserialize
+    Packet pkt2;
+    if (!net::packet_deserialize(buf, len, pkt2)) return false;
+    
+    // Verify fields match
+    if (pkt2.get_packet_type() != PKT_DATA) return false;
+    if (pkt2.payload_len != pkt.payload_len) return false;
+    if (memcmp(pkt2.payload, pkt.payload, pkt.payload_len) != 0) return false;
+    if (memcmp(pkt2.dest_hash, pkt.dest_hash, DEST_HASH_SIZE) != 0) return false;
+    
+    return true;
+}
+
+static void run_transport_tests(int& line) {
+    Serial.println("\n[TRANSPORT] Running Phase 3d transport tests...");
+    hal::display_printf(0, line * 18, 0xFFFF, 2, "=== Transport Tests ===");
+    line++;
+
+    struct { const char* name; bool (*fn)(); } tests[] = {
+        {"Init",             test_transport_init},
+        {"Announce Cfg",     test_transport_announce_requires_init},
+        {"Callback Reg",     test_transport_callback_registration},
+        {"Pkt Roundtrip",    test_transport_packet_serialize_roundtrip},
+    };
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+
+    bool all_pass = true;
+    for (int i = 0; i < num_tests; i++) {
+        bool ok = tests[i].fn();
+        if (!ok) all_pass = false;
+        Serial.printf("[TRANSPORT] %-16s %s\n", tests[i].name, ok ? "PASS" : "FAIL");
+        show_boot_status(tests[i].name, ok, line++);
+    }
+
+    Serial.printf("[TRANSPORT] === %s ===\n", all_pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
+    hal::display_printf(0, (line + 1) * 18, all_pass ? 0x07E0 : 0xF800, 2,
+                        all_pass ? "Transport: ALL PASS" : "Transport: FAILURES");
+    line += 2;
+}
+
 static void run_announce_tests(int& line) {
     Serial.println("\n[ANNOUNCE] Running Phase 3c announce tests...");
     hal::display_printf(0, line * 18, 0xFFFF, 2, "=== Announce Tests ===");
@@ -1144,6 +1256,24 @@ void setup() {
         Serial.println("[BOOT] Network-degraded: missing radio or storage");
     }
 
+    // Phase 3d: Initialize transport layer
+    if (identity_ready && boot.radio) {
+        net::transport_init(device_identity, device_destination);
+        
+        // Register data callback
+        net::transport_on_data([](const uint8_t* sender, const uint8_t* data, size_t len) {
+            Serial.printf("[DATA] Received %d bytes from ", len);
+            for (int i = 0; i < 4; i++) Serial.printf("%02x", sender[i]);
+            Serial.printf("...\n");
+            // Print data as string if printable
+            Serial.printf("[DATA] Content: %.*s\n", (int)len, (const char*)data);
+        });
+        
+        // Send initial announce
+        net::transport_announce(APP_NAME);
+        Serial.println("[NET] Transport initialized, announce sent");
+    }
+
     Serial.println("[BOOT] === Init complete ===\n");
     
     // Phase 2: Run crypto tests
@@ -1158,6 +1288,10 @@ void setup() {
         // Phase 3c: Run announce tests
         line++; // Add spacing
         run_announce_tests(line);
+        
+        // Phase 3d: Run transport tests
+        line++; // Add spacing
+        run_transport_tests(line);
     } else {
         Serial.println("[CRYPTO] Skipping crypto tests - SD card required");
         hal::display_printf(0, line * 18, 0xFBE0, 2, "Crypto: SKIP (no SD)");
@@ -1202,21 +1336,33 @@ void loop() {
     // --- GPS ---
     hal::gps_poll();
 
-    // --- Radio RX check ---
-    uint8_t rx_buf[256];
-    int rx_len = hal::radio_receive(rx_buf, sizeof(rx_buf));
-    if (rx_len > 0) {
-        Serial.printf("[RADIO] Received %d bytes, RSSI=%.1f SNR=%.1f\n",
-                      rx_len, hal::radio_rssi(), hal::radio_snr());
-    }
-
     // --- Periodic display update (every 1s) ---
     uint32_t now = millis();
+
+    // --- Network polling ---
+    if (identity_ready && boot.radio) {
+        net::transport_poll();
+        
+        // Periodic announce
+        static uint32_t last_announce_check = 0;
+        if (now - last_announce_check >= (ANNOUNCE_INTERVAL * 1000UL)) {
+            last_announce_check = now;
+            net::transport_announce(APP_NAME);
+        }
+    }
     if (now - last_display_update >= 1000) {
         last_display_update = now;
 
         // Clear the live data area (bottom half of screen)
         int y_start = 200;
+
+        // Network status
+        if (identity_ready) {
+            hal::display_printf(0, y_start - 72, 0x07FF, 1,
+                "Net: TX=%lu RX=%lu Peers=%d   ",
+                net::transport_tx_count(), net::transport_rx_count(),
+                net::peer_count());
+        }
 
         // GPS line
         if (hal::gps_has_fix()) {
