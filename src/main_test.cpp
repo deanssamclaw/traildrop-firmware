@@ -1241,6 +1241,17 @@ void setup() {
             Serial.printf("[ID] Destination:   ");
             for (int i = 0; i < 16; i++) Serial.printf("%02x", device_destination.hash[i]);
             Serial.println();
+
+            // Dump full identity key bytes for wire compat test capture
+            // Format: x25519_prv(32) + x25519_pub(32) + ed25519_prv(32) + ed25519_pub(32)
+            uint8_t id_bytes[128];
+            memcpy(id_bytes, device_identity.x25519_private, 32);
+            memcpy(id_bytes + 32, device_identity.x25519_public, 32);
+            memcpy(id_bytes + 64, device_identity.ed25519_private, 32);
+            memcpy(id_bytes + 96, device_identity.ed25519_public, 32);
+            Serial.print("[ID_KEY] ");
+            for (int i = 0; i < 128; i++) Serial.printf("%02x", id_bytes[i]);
+            Serial.println();
             
             // Show on display
             hal::display_printf(0, line * 18, 0x07FF, 1, "ID: %02x%02x%02x%02x...",

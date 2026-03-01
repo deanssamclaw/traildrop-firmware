@@ -678,6 +678,27 @@ def main():
     if not b_ready:
         print("  WARN: Device B may not have network initialized")
 
+    # Extract and cache identity keys from boot output ([ID_KEY] lines)
+    identity_cache_dir = os.path.join(os.path.dirname(__file__), ".identity_cache")
+    os.makedirs(identity_cache_dir, exist_ok=True)
+
+    for label, boot_lines, cache_name in [
+        ("Device A", boot_a, "device_a_identity.dat"),
+        ("Device B", boot_b, "device_b_identity.dat"),
+    ]:
+        for line in boot_lines:
+            if "[ID_KEY]" in line:
+                hex_key = line.split("[ID_KEY]")[-1].strip()
+                try:
+                    key_bytes = bytes.fromhex(hex_key)
+                    if len(key_bytes) == 128:
+                        cache_path = os.path.join(identity_cache_dir, cache_name)
+                        with open(cache_path, "wb") as f:
+                            f.write(key_bytes)
+                        print(f"  Cached {label} identity key ({cache_path})")
+                except ValueError:
+                    pass
+
     # Run tests
     announce = test_2a_announce_capture(ser_a, ser_b)
     test_2b_data_capture(ser_a, ser_b, announce)
