@@ -26,6 +26,8 @@
 #include "net/peer.h"
 #include "net/announce.h"
 #include "net/transport.h"
+#include "msg/msgpack.h"
+#include "msg/lxmf.h"
 #include <RNG.h>
 
 // Device identity (global, used by networking later)
@@ -1108,6 +1110,586 @@ static void run_announce_tests(int& line) {
     line += 2;
 }
 
+// ============================================================
+// Phase 4a: msgpack + LXMF Tests
+// ============================================================
+
+// Helper: convert hex string to bytes (compile-time known vectors)
+static int hex_to_bytes(const char* hex, uint8_t* out, size_t max_len) {
+    size_t hex_len = strlen(hex);
+    size_t byte_len = hex_len / 2;
+    if (byte_len > max_len) return -1;
+    for (size_t i = 0; i < byte_len; i++) {
+        char hi = hex[i*2], lo = hex[i*2+1];
+        auto nibble = [](char c) -> uint8_t {
+            if (c >= '0' && c <= '9') return c - '0';
+            if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+            if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+            return 0;
+        };
+        out[i] = (nibble(hi) << 4) | nibble(lo);
+    }
+    return (int)byte_len;
+}
+
+static bool test_msgpack_encode_match() {
+    // Test that our encoder produces identical bytes to Python msgpack
+    uint8_t buf[64];
+    bool ok = true;
+
+    // nil
+    { msg::Encoder e(buf, sizeof(buf)); e.write_nil();
+      ok &= (e.pos == 1 && buf[0] == 0xc0); }
+
+    // true / false
+    { msg::Encoder e(buf, sizeof(buf)); e.write_bool(true);
+      ok &= (e.pos == 1 && buf[0] == 0xc3); }
+    { msg::Encoder e(buf, sizeof(buf)); e.write_bool(false);
+      ok &= (e.pos == 1 && buf[0] == 0xc2); }
+
+    // positive fixint
+    { msg::Encoder e(buf, sizeof(buf)); e.write_uint(0);
+      ok &= (e.pos == 1 && buf[0] == 0x00); }
+    { msg::Encoder e(buf, sizeof(buf)); e.write_uint(42);
+      ok &= (e.pos == 1 && buf[0] == 0x2a); }
+    { msg::Encoder e(buf, sizeof(buf)); e.write_uint(127);
+      ok &= (e.pos == 1 && buf[0] == 0x7f); }
+
+    // uint8
+    { msg::Encoder e(buf, sizeof(buf)); e.write_uint(128);
+      ok &= (e.pos == 2 && buf[0] == 0xcc && buf[1] == 0x80); }
+    { msg::Encoder e(buf, sizeof(buf)); e.write_uint(255);
+      ok &= (e.pos == 2 && buf[0] == 0xcc && buf[1] == 0xff); }
+
+    // uint16
+    { msg::Encoder e(buf, sizeof(buf)); e.write_uint(256);
+      ok &= (e.pos == 3 && buf[0] == 0xcd && buf[1] == 0x01 && buf[2] == 0x00); }
+
+    // CRITICAL: field keys 0xFB/0xFC must be uint8, not fixint
+    { msg::Encoder e(buf, sizeof(buf)); e.write_uint(251);
+      ok &= (e.pos == 2 && buf[0] == 0xcc && buf[1] == 0xfb); }
+    { msg::Encoder e(buf, sizeof(buf)); e.write_uint(252);
+      ok &= (e.pos == 2 && buf[0] == 0xcc && buf[1] == 0xfc); }
+
+    // negative fixint
+    { msg::Encoder e(buf, sizeof(buf)); e.write_int(-1);
+      ok &= (e.pos == 1 && buf[0] == 0xff); }
+    { msg::Encoder e(buf, sizeof(buf)); e.write_int(-32);
+      ok &= (e.pos == 1 && buf[0] == 0xe0); }
+
+    // int8
+    { msg::Encoder e(buf, sizeof(buf)); e.write_int(-33);
+      ok &= (e.pos == 2 && buf[0] == 0xd0 && buf[1] == 0xdf); }
+    { msg::Encoder e(buf, sizeof(buf)); e.write_int(-128);
+      ok &= (e.pos == 2 && buf[0] == 0xd0 && buf[1] == 0x80); }
+
+    // float64 — timestamp 1709000000.5
+    { msg::Encoder e(buf, sizeof(buf)); e.write_float64(1709000000.5);
+      uint8_t expected[] = {0xcb, 0x41, 0xd9, 0x77, 0x51, 0x50, 0x20, 0x00, 0x00};
+      ok &= (e.pos == 9 && memcmp(buf, expected, 9) == 0); }
+
+    // bin8 — "Test" (4 bytes)
+    { msg::Encoder e(buf, sizeof(buf));
+      e.write_bin((const uint8_t*)"Test", 4);
+      uint8_t expected[] = {0xc4, 0x04, 'T', 'e', 's', 't'};
+      ok &= (e.pos == 6 && memcmp(buf, expected, 6) == 0); }
+
+    // bin8 — empty
+    { msg::Encoder e(buf, sizeof(buf));
+      e.write_bin(nullptr, 0);
+      ok &= (e.pos == 2 && buf[0] == 0xc4 && buf[1] == 0x00); }
+
+    // fixstr — "lat"
+    { msg::Encoder e(buf, sizeof(buf)); e.write_str("lat", 3);
+      ok &= (e.pos == 4 && buf[0] == 0xa3 && buf[1] == 'l' && buf[2] == 'a' && buf[3] == 't'); }
+
+    // fixarray(0)
+    { msg::Encoder e(buf, sizeof(buf)); e.write_array(0);
+      ok &= (e.pos == 1 && buf[0] == 0x90); }
+
+    // fixarray(4) + 4 fixints
+    { msg::Encoder e(buf, sizeof(buf));
+      e.write_array(4); e.write_uint(1); e.write_uint(2); e.write_uint(3); e.write_uint(4);
+      uint8_t expected[] = {0x94, 0x01, 0x02, 0x03, 0x04};
+      ok &= (e.pos == 5 && memcmp(buf, expected, 5) == 0); }
+
+    // fixmap(0)
+    { msg::Encoder e(buf, sizeof(buf)); e.write_map(0);
+      ok &= (e.pos == 1 && buf[0] == 0x80); }
+
+    if (!ok) {
+        Serial.println("[MSGPACK] Encode match details:");
+        // Rerun to find which failed
+        msg::Encoder e(buf, sizeof(buf)); e.write_uint(251);
+        Serial.printf("  uint(251): pos=%d [%02x %02x]\n", e.pos, buf[0], buf[1]);
+    }
+
+    return ok;
+}
+
+static bool test_msgpack_decode_roundtrip() {
+    // Encode → Decode → verify values
+    uint8_t buf[128];
+    msg::Encoder enc(buf, sizeof(buf));
+
+    enc.write_array(4);
+    enc.write_float64(1709000000.5);
+    enc.write_bin((const uint8_t*)"Test", 4);
+    enc.write_bin((const uint8_t*)"Hello from Python!", 18);
+    enc.write_map(0);
+    if (enc.error) return false;
+
+    msg::Decoder dec(buf, enc.pos);
+    uint8_t arr = dec.read_array();
+    if (dec.error || arr != 4) return false;
+
+    double ts = dec.read_float64();
+    if (dec.error || ts != 1709000000.5) return false;
+
+    uint8_t title[64];
+    size_t title_len = dec.read_bin(title, sizeof(title));
+    if (dec.error || title_len != 4 || memcmp(title, "Test", 4) != 0) return false;
+
+    uint8_t content[64];
+    size_t content_len = dec.read_bin(content, sizeof(content));
+    if (dec.error || content_len != 18 || memcmp(content, "Hello from Python!", 18) != 0) return false;
+
+    uint8_t map_count = dec.read_map();
+    if (dec.error || map_count != 0) return false;
+
+    return true;
+}
+
+static bool test_msgpack_payload_binary_match() {
+    // Verify our encoder produces identical bytes to Python for an LXMF payload
+    // Python: msgpack.packb([1709000000.5, b"Test", b"Hello from Python!", {}])
+    // Expected: 94cb41d9775150200000c40454657374c41248656c6c6f2066726f6d20507974686f6e2180
+    const char* expected_hex = "94cb41d9775150200000c40454657374c41248656c6c6f2066726f6d20507974686f6e2180";
+    uint8_t expected[64];
+    int expected_len = hex_to_bytes(expected_hex, expected, sizeof(expected));
+
+    uint8_t buf[128];
+    msg::Encoder enc(buf, sizeof(buf));
+    enc.write_array(4);
+    enc.write_float64(1709000000.5);
+    enc.write_bin((const uint8_t*)"Test", 4);
+    enc.write_bin((const uint8_t*)"Hello from Python!", 18);
+    enc.write_map(0);
+
+    if (enc.error) return false;
+    if ((int)enc.pos != expected_len) {
+        Serial.printf("[MSGPACK] Payload len mismatch: got %d, expected %d\n", enc.pos, expected_len);
+        return false;
+    }
+    if (memcmp(buf, expected, expected_len) != 0) {
+        Serial.printf("[MSGPACK] Payload bytes mismatch\n");
+        Serial.printf("  Got:      ");
+        for (size_t i = 0; i < enc.pos; i++) Serial.printf("%02x", buf[i]);
+        Serial.println();
+        Serial.printf("  Expected: %s\n", expected_hex);
+        return false;
+    }
+    return true;
+}
+
+static bool test_msgpack_fields_binary_match() {
+    // Python: msgpack.packb({251: b"type_val", 252: b"data_val"})
+    // Expected: 82ccfbc408747970655f76616cccfcc408646174615f76616c
+    const char* expected_hex = "82ccfbc408747970655f76616cccfcc408646174615f76616c";
+    uint8_t expected[64];
+    int expected_len = hex_to_bytes(expected_hex, expected, sizeof(expected));
+
+    uint8_t buf[64];
+    msg::Encoder enc(buf, sizeof(buf));
+    enc.write_map(2);
+    enc.write_uint(251);
+    enc.write_bin((const uint8_t*)"type_val", 8);
+    enc.write_uint(252);
+    enc.write_bin((const uint8_t*)"data_val", 8);
+
+    if (enc.error) return false;
+    if ((int)enc.pos != expected_len) return false;
+    return memcmp(buf, expected, expected_len) == 0;
+}
+
+static bool test_lxmf_build_hash_match() {
+    // Build LXMF message with test vector keys and verify hash matches Python
+    // Using keys and values from test vector generator output
+
+    // Sender identity
+    crypto::Identity sender;
+    hex_to_bytes("387b35263170015ac008c58a9755350e28f541843a0acb58a142199858ec4e6b",
+                 sender.x25519_private, 32);
+    hex_to_bytes("338298dec0eeb458587f5792cac3dd70e0e73699a17a2362d00ab3868ba6b313",
+                 sender.x25519_public, 32);
+    hex_to_bytes("258494ef78f67f7197cd0a52933b72657a346b8792a14ee0f7093a8175441968",
+                 sender.ed25519_private, 32);
+    hex_to_bytes("bcf6af73c182888032960d55f0679c43f7bf7667594743254cef72532cbdc213",
+                 sender.ed25519_public, 32);
+    hex_to_bytes("cc4e2bc21134c415f4d685016a443914", sender.hash, 16);
+    sender.valid = true;
+
+    uint8_t sender_dest_hash[16];
+    hex_to_bytes("b32367e2bddccefe0b15b6f5c957676c", sender_dest_hash, 16);
+
+    uint8_t receiver_dest_hash[16];
+    hex_to_bytes("95235d913409716dd8f28afe94cb678f", receiver_dest_hash, 16);
+
+    // Build message
+    const char* title = "Test";
+    const char* content = "Hello from Python!";
+    uint8_t out[512];
+    size_t out_len = sizeof(out);
+    uint8_t message_hash[32];
+
+    bool built = msg::lxmf_build(
+        sender, sender_dest_hash, receiver_dest_hash,
+        1709000000.5,
+        (const uint8_t*)title, 4,
+        (const uint8_t*)content, 18,
+        nullptr, 0, nullptr, 0,
+        out, &out_len, message_hash
+    );
+    if (!built) {
+        Serial.println("[LXMF] Build failed");
+        return false;
+    }
+
+    // Verify hash matches Python
+    uint8_t expected_hash[32];
+    hex_to_bytes("a4760018f636e907660edb9495ac075ea6dd2db8ebbceae08a752feb68d84e48",
+                 expected_hash, 32);
+
+    if (memcmp(message_hash, expected_hash, 32) != 0) {
+        Serial.printf("[LXMF] Hash mismatch!\n  Got:    ");
+        for (int i = 0; i < 32; i++) Serial.printf("%02x", message_hash[i]);
+        Serial.printf("\n  Expect: ");
+        for (int i = 0; i < 32; i++) Serial.printf("%02x", expected_hash[i]);
+        Serial.println();
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_lxmf_build_signature_match() {
+    // Build message and verify signature matches Python's
+    crypto::Identity sender;
+    hex_to_bytes("387b35263170015ac008c58a9755350e28f541843a0acb58a142199858ec4e6b",
+                 sender.x25519_private, 32);
+    hex_to_bytes("338298dec0eeb458587f5792cac3dd70e0e73699a17a2362d00ab3868ba6b313",
+                 sender.x25519_public, 32);
+    hex_to_bytes("258494ef78f67f7197cd0a52933b72657a346b8792a14ee0f7093a8175441968",
+                 sender.ed25519_private, 32);
+    hex_to_bytes("bcf6af73c182888032960d55f0679c43f7bf7667594743254cef72532cbdc213",
+                 sender.ed25519_public, 32);
+    sender.valid = true;
+
+    uint8_t sender_dest_hash[16], receiver_dest_hash[16];
+    hex_to_bytes("b32367e2bddccefe0b15b6f5c957676c", sender_dest_hash, 16);
+    hex_to_bytes("95235d913409716dd8f28afe94cb678f", receiver_dest_hash, 16);
+
+    uint8_t out[512];
+    size_t out_len = sizeof(out);
+    uint8_t message_hash[32];
+
+    msg::lxmf_build(sender, sender_dest_hash, receiver_dest_hash,
+                    1709000000.5,
+                    (const uint8_t*)"Test", 4,
+                    (const uint8_t*)"Hello from Python!", 18,
+                    nullptr, 0, nullptr, 0,
+                    out, &out_len, message_hash);
+
+    // Signature is at out[16..80)
+    uint8_t expected_sig[64];
+    hex_to_bytes("d994ae8401dab045fa2e2581789f3a2e2bcfae6f32f2fcee4d37e1fa02a382ee"
+                 "88351091198d8821beea40129793481f3ecb56776a6a2c2d21b608370dc31f04",
+                 expected_sig, 64);
+
+    if (memcmp(out + 16, expected_sig, 64) != 0) {
+        Serial.printf("[LXMF] Signature mismatch!\n  Got:    ");
+        for (int i = 0; i < 64; i++) Serial.printf("%02x", out[16 + i]);
+        Serial.printf("\n  Expect: ");
+        for (int i = 0; i < 64; i++) Serial.printf("%02x", expected_sig[i]);
+        Serial.println();
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_lxmf_parse_simple() {
+    // Parse Python-generated LXMF message and verify extracted fields
+    uint8_t full_packed[512];
+    int full_len = hex_to_bytes(
+        "95235d913409716dd8f28afe94cb678f"  // dest_hash
+        "b32367e2bddccefe0b15b6f5c957676c"  // source_hash
+        "d994ae8401dab045fa2e2581789f3a2e2bcfae6f32f2fcee4d37e1fa02a382ee"  // sig[0:32]
+        "88351091198d8821beea40129793481f3ecb56776a6a2c2d21b608370dc31f04"  // sig[32:64]
+        "94cb41d9775150200000c40454657374c41248656c6c6f2066726f6d20507974686f6e2180",  // payload
+        full_packed, sizeof(full_packed));
+
+    msg::LXMessage msg;
+    if (!msg::lxmf_parse(full_packed, full_len, msg)) {
+        Serial.println("[LXMF] Parse failed");
+        return false;
+    }
+
+    // Verify timestamp
+    if (msg.timestamp != 1709000000.5) {
+        Serial.printf("[LXMF] Timestamp mismatch: got %f\n", msg.timestamp);
+        return false;
+    }
+
+    // Verify title
+    if (msg.title_len != 4 || memcmp(msg.title, "Test", 4) != 0) {
+        Serial.printf("[LXMF] Title mismatch: len=%d\n", msg.title_len);
+        return false;
+    }
+
+    // Verify content
+    if (msg.content_len != 18 || memcmp(msg.content, "Hello from Python!", 18) != 0) {
+        Serial.printf("[LXMF] Content mismatch: len=%d\n", msg.content_len);
+        return false;
+    }
+
+    // Verify hash matches expected
+    uint8_t expected_hash[32];
+    hex_to_bytes("a4760018f636e907660edb9495ac075ea6dd2db8ebbceae08a752feb68d84e48",
+                 expected_hash, 32);
+    if (memcmp(msg.message_hash, expected_hash, 32) != 0) {
+        Serial.println("[LXMF] Parse hash mismatch");
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_lxmf_verify_signature() {
+    // Parse Python message then verify signature with sender's ed25519 public key
+    uint8_t full_packed[512];
+    int full_len = hex_to_bytes(
+        "95235d913409716dd8f28afe94cb678f"
+        "b32367e2bddccefe0b15b6f5c957676c"
+        "d994ae8401dab045fa2e2581789f3a2e2bcfae6f32f2fcee4d37e1fa02a382ee"
+        "88351091198d8821beea40129793481f3ecb56776a6a2c2d21b608370dc31f04"
+        "94cb41d9775150200000c40454657374c41248656c6c6f2066726f6d20507974686f6e2180",
+        full_packed, sizeof(full_packed));
+
+    msg::LXMessage msg;
+    if (!msg::lxmf_parse(full_packed, full_len, msg)) return false;
+
+    uint8_t sender_ed25519_pub[32];
+    hex_to_bytes("bcf6af73c182888032960d55f0679c43f7bf7667594743254cef72532cbdc213",
+                 sender_ed25519_pub, 32);
+
+    bool verified = msg::lxmf_verify(msg, sender_ed25519_pub);
+    if (!verified) {
+        Serial.println("[LXMF] Signature verification failed");
+    }
+    return verified;
+}
+
+static bool test_lxmf_fields_roundtrip() {
+    // Build message with custom fields, parse it back, verify fields
+    crypto::Identity sender;
+    hex_to_bytes("387b35263170015ac008c58a9755350e28f541843a0acb58a142199858ec4e6b",
+                 sender.x25519_private, 32);
+    hex_to_bytes("338298dec0eeb458587f5792cac3dd70e0e73699a17a2362d00ab3868ba6b313",
+                 sender.x25519_public, 32);
+    hex_to_bytes("258494ef78f67f7197cd0a52933b72657a346b8792a14ee0f7093a8175441968",
+                 sender.ed25519_private, 32);
+    hex_to_bytes("bcf6af73c182888032960d55f0679c43f7bf7667594743254cef72532cbdc213",
+                 sender.ed25519_public, 32);
+    sender.valid = true;
+
+    uint8_t sender_dest_hash[16], receiver_dest_hash[16];
+    hex_to_bytes("b32367e2bddccefe0b15b6f5c957676c", sender_dest_hash, 16);
+    hex_to_bytes("95235d913409716dd8f28afe94cb678f", receiver_dest_hash, 16);
+
+    const uint8_t* custom_type = (const uint8_t*)"traildrop/waypoint";
+    // Pre-encoded waypoint data: msgpack({"lat": 38.9717, "lon": -95.2353})
+    uint8_t custom_data[32];
+    int custom_data_len = hex_to_bytes(
+        "82a36c6174cb40437c60aa64c2f8a36c6f6ecbc057cf0f27bb2fec",
+        custom_data, sizeof(custom_data));
+
+    uint8_t out[512];
+    size_t out_len = sizeof(out);
+    uint8_t message_hash[32];
+
+    bool built = msg::lxmf_build(
+        sender, sender_dest_hash, receiver_dest_hash,
+        1709000001.0,
+        (const uint8_t*)"Waypoint", 8,
+        (const uint8_t*)"Camp waypoint", 13,
+        custom_type, 18,
+        custom_data, custom_data_len,
+        out, &out_len, message_hash
+    );
+    if (!built) return false;
+
+    // Verify hash matches Python
+    uint8_t expected_hash[32];
+    hex_to_bytes("8f6bd07bb552a21cf95c96e8353290254d2f7fddd413cc14a0f08ca0ea4ebdaf",
+                 expected_hash, 32);
+    if (memcmp(message_hash, expected_hash, 32) != 0) {
+        Serial.printf("[LXMF] Fields hash mismatch\n");
+        return false;
+    }
+
+    // Reconstruct full LXMF (prepend dest_hash) and parse
+    uint8_t full_lxmf[600];
+    memcpy(full_lxmf, receiver_dest_hash, 16);
+    memcpy(full_lxmf + 16, out, out_len);
+
+    msg::LXMessage parsed;
+    if (!msg::lxmf_parse(full_lxmf, 16 + out_len, parsed)) {
+        Serial.println("[LXMF] Fields parse failed");
+        return false;
+    }
+
+    if (!parsed.has_custom_fields) return false;
+    if (parsed.custom_type_len != 18) return false;
+    if (memcmp(parsed.custom_type, "traildrop/waypoint", 18) != 0) return false;
+    if ((int)parsed.custom_data_len != custom_data_len) return false;
+    if (memcmp(parsed.custom_data, custom_data, custom_data_len) != 0) return false;
+
+    return true;
+}
+
+static bool test_lxmf_stamp_handling() {
+    // Parse a 5-element payload (stamped) and verify hash matches 4-element hash
+    // packed_5elem: 95cb41d9775150200000c40454657374c41248656c6c6f2066726f6d20507974686f6e2180c410aaaa...
+    // After stamp stripping, hash should match simple message hash
+
+    uint8_t receiver_dest_hash[16], sender_dest_hash[16];
+    hex_to_bytes("95235d913409716dd8f28afe94cb678f", receiver_dest_hash, 16);
+    hex_to_bytes("b32367e2bddccefe0b15b6f5c957676c", sender_dest_hash, 16);
+
+    // Construct fake full LXMF with stamped payload
+    uint8_t packed_5[64];
+    int packed_5_len = hex_to_bytes(
+        "95cb41d9775150200000c40454657374c41248656c6c6f2066726f6d20507974686f6e2180"
+        "c410aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        packed_5, sizeof(packed_5));
+
+    // Build fake full LXMF: dest_hash + source_hash + fake_signature + packed_5elem
+    uint8_t full_lxmf[256];
+    memcpy(full_lxmf, receiver_dest_hash, 16);
+    memcpy(full_lxmf + 16, sender_dest_hash, 16);
+    memset(full_lxmf + 32, 0xBB, 64);  // fake signature
+    memcpy(full_lxmf + 96, packed_5, packed_5_len);
+
+    msg::LXMessage msg;
+    if (!msg::lxmf_parse(full_lxmf, 96 + packed_5_len, msg)) {
+        Serial.println("[LXMF] Stamp parse failed");
+        return false;
+    }
+
+    // Hash should match the simple (unstamped) message hash
+    uint8_t expected_hash[32];
+    hex_to_bytes("a4760018f636e907660edb9495ac075ea6dd2db8ebbceae08a752feb68d84e48",
+                 expected_hash, 32);
+
+    if (memcmp(msg.message_hash, expected_hash, 32) != 0) {
+        Serial.printf("[LXMF] Stamp hash mismatch!\n  Got:    ");
+        for (int i = 0; i < 32; i++) Serial.printf("%02x", msg.message_hash[i]);
+        Serial.printf("\n  Expect: ");
+        for (int i = 0; i < 32; i++) Serial.printf("%02x", expected_hash[i]);
+        Serial.println();
+        return false;
+    }
+
+    // Also verify the packed_payload was correctly re-packed as 4 elements
+    uint8_t expected_4elem[64];
+    int expected_4_len = hex_to_bytes(
+        "94cb41d9775150200000c40454657374c41248656c6c6f2066726f6d20507974686f6e2180",
+        expected_4elem, sizeof(expected_4elem));
+
+    if ((int)msg.packed_payload_len != expected_4_len) {
+        Serial.printf("[LXMF] Repacked len mismatch: %d vs %d\n", msg.packed_payload_len, expected_4_len);
+        return false;
+    }
+    if (memcmp(msg.packed_payload, expected_4elem, expected_4_len) != 0) {
+        Serial.println("[LXMF] Repacked bytes mismatch");
+        return false;
+    }
+
+    return true;
+}
+
+static bool test_lxmf_parse_python_fields() {
+    // Parse Python-generated fields message and verify all fields extracted
+    uint8_t full_packed[512];
+    int full_len = hex_to_bytes(
+        "95235d913409716dd8f28afe94cb678f"  // dest_hash
+        "b32367e2bddccefe0b15b6f5c957676c"  // source_hash
+        "5156a03cdee4dfdd7a1cc5cc1da91430402b8fa4ee78f87284da97c50b3aa848"  // sig
+        "d3433fb6468a3470598527fcf23ee3e0bbd0c760660cc7164eeb99b804b1580c"
+        "94cb41d9775150400000c408576179706f696e74c40d43616d7020776179706f696e74"
+        "82ccfbc412747261696c64726f702f776179706f696e74"
+        "ccfcc41b82a36c6174cb40437c60aa64c2f8a36c6f6ecbc057cf0f27bb2fec",
+        full_packed, sizeof(full_packed));
+
+    msg::LXMessage msg;
+    if (!msg::lxmf_parse(full_packed, full_len, msg)) {
+        Serial.println("[LXMF] Python fields parse failed");
+        return false;
+    }
+
+    if (msg.timestamp != 1709000001.0) return false;
+    if (msg.title_len != 8 || memcmp(msg.title, "Waypoint", 8) != 0) return false;
+    if (msg.content_len != 13 || memcmp(msg.content, "Camp waypoint", 13) != 0) return false;
+    if (!msg.has_custom_fields) return false;
+    if (msg.custom_type_len != 18 || memcmp(msg.custom_type, "traildrop/waypoint", 18) != 0) return false;
+
+    // Verify signature with sender's key
+    uint8_t sender_ed25519_pub[32];
+    hex_to_bytes("bcf6af73c182888032960d55f0679c43f7bf7667594743254cef72532cbdc213",
+                 sender_ed25519_pub, 32);
+    if (!msg::lxmf_verify(msg, sender_ed25519_pub)) {
+        Serial.println("[LXMF] Python fields signature verify failed");
+        return false;
+    }
+
+    return true;
+}
+
+static void run_msgpack_lxmf_tests(int& line) {
+    Serial.println("\n[PHASE4A] Running Phase 4a msgpack + LXMF tests...");
+    hal::display_printf(0, line * 18, 0xFFFF, 2, "=== LXMF Tests ===");
+    line++;
+
+    struct { const char* name; bool (*fn)(); } tests[] = {
+        {"MP Encode",        test_msgpack_encode_match},
+        {"MP Roundtrip",     test_msgpack_decode_roundtrip},
+        {"MP Payload Bin",   test_msgpack_payload_binary_match},
+        {"MP Fields Bin",    test_msgpack_fields_binary_match},
+        {"LXMF Hash",        test_lxmf_build_hash_match},
+        {"LXMF Signature",   test_lxmf_build_signature_match},
+        {"LXMF Parse",       test_lxmf_parse_simple},
+        {"LXMF Verify",      test_lxmf_verify_signature},
+        {"LXMF Fields RT",   test_lxmf_fields_roundtrip},
+        {"LXMF Stamp",       test_lxmf_stamp_handling},
+        {"LXMF Py Fields",   test_lxmf_parse_python_fields},
+    };
+    int num_tests = sizeof(tests) / sizeof(tests[0]);
+
+    bool all_pass = true;
+    for (int i = 0; i < num_tests; i++) {
+        bool ok = tests[i].fn();
+        if (!ok) all_pass = false;
+        Serial.printf("[PHASE4A] %-16s %s\n", tests[i].name, ok ? "PASS" : "FAIL");
+        show_boot_status(tests[i].name, ok, line++);
+    }
+
+    Serial.printf("[PHASE4A] === %s ===\n", all_pass ? "ALL TESTS PASSED" : "SOME TESTS FAILED");
+    hal::display_printf(0, (line + 1) * 18, all_pass ? 0x07E0 : 0xF800, 2,
+                        all_pass ? "LXMF: ALL PASS" : "LXMF: FAILURES");
+    line += 2;
+}
+
 void setup() {
     Serial.begin(115200);
     delay(500);
@@ -1312,7 +1894,11 @@ void setup() {
         // Phase 3d: Run transport tests
         line++; // Add spacing
         run_transport_tests(line);
-        
+
+        // Phase 4a: Run msgpack + LXMF tests
+        line++; // Add spacing
+        run_msgpack_lxmf_tests(line);
+
         // Re-initialize after tests:
         // - Transport tests overwrite s_identity/s_destination with stack-local pointers
         // - Announce tests leave stale test peers in the peer table
