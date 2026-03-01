@@ -1,589 +1,619 @@
 #!/usr/bin/env python3
 """
 Wire Compatibility Test: ESP32 TrailDrop ↔ Python Reticulum
-Part 1 — Software tests proving identical crypto and wire format.
+Part 1 — Software tests using ACTUAL device keys extracted from ESP32 SD cards.
 
-Runs on rflab-sam with RNS installed.
+Proves both implementations produce identical:
+  - Identity hashes (SHA-256 of public keys, truncated to 16 bytes)
+  - Destination hashes (SHA-256 of name_hash + identity_hash, truncated to 16 bytes)
+  - HKDF-SHA256 key derivations (64-byte output split into signing + encryption keys)
+  - Token encrypt/decrypt (AES-256-CBC + HMAC-SHA256)
+  - Full identity encrypt/decrypt (ECDH + HKDF + Token)
+  - Announce packet structure (field order, sizes, Ed25519 signature)
+
+Runs on rflab-sam with RNS (rns v1.1.3) installed.
 """
 
 import hashlib
-import hmac
+import hmac as hmac_mod
 import os
-import struct
 import sys
 from math import ceil
 
-# ---------------------------------------------------------------------------
-# ESP32 Algorithm Reimplementation (pure Python, no RNS dependency)
-# These functions mirror src/crypto/ and src/net/ exactly.
-# ---------------------------------------------------------------------------
+# ===================================================================
+# Actual device keys extracted from ESP32 SD cards (/traildrop/identity.dat)
+# Format: x25519_priv(32) + x25519_pub(32) + ed25519_priv(32) + ed25519_pub(32)
+# ===================================================================
 
-def esp32_sha256(data: bytes) -> bytes:
+DEVICE_A = {
+    "name": "Device A (ttyACM1)",
+    "x25519_priv": bytes.fromhex(
+        "58d8ca089636bc39f7b8a7d2b314fc230d2f109640cc541e3720af9949698147"
+    ),
+    "x25519_pub": bytes.fromhex(
+        "b18f12eb5964224ea98002652c09b3629ce5547bc101d0c5d31d62efb2ec8c6c"
+    ),
+    "ed25519_priv": bytes.fromhex(
+        "e507599987e5d53ab37f5a1072ddba8a661776c3b52a5ead6448b9831b3cec9f"
+    ),
+    "ed25519_pub": bytes.fromhex(
+        "fb41f1b30140453bec1fb1bf849acb4be4855712490a08ae0a8089fcceabf501"
+    ),
+    "expected_identity_hash": "530edfd3154e564a90c41eec5d93f586",
+    "expected_dest_hash": "19820e6239feccf4a37b65cd73f7668d",
+}
+
+DEVICE_B = {
+    "name": "Device B (ttyACM0)",
+    "x25519_priv": bytes.fromhex(
+        "a0af34a7f95e75b172782858189e5c527096cdeca41940a9c60b798a86ff066c"
+    ),
+    "x25519_pub": bytes.fromhex(
+        "0c961b624d228a7d6186dd521f9681c9841420544aa9a8bed980c97fde31616a"
+    ),
+    "ed25519_priv": bytes.fromhex(
+        "72c5a7e65082afcf2a8a3466648d8211aa28b2e5ff3f738b7cdd369c0621854a"
+    ),
+    "ed25519_pub": bytes.fromhex(
+        "0ab49613cd0ccc7a2e38dc6464cf3064b91e0becbf58f275ca8351eb7920db2d"
+    ),
+    "expected_identity_hash": "1b22687bfffbe8832a9520b2d31916fd",
+    "expected_dest_hash": "ff6b89bede65c0ae89b7957f6bf0b3b8",
+}
+
+FULL_NAME = "traildrop.waypoint"
+
+# Protocol constants (from config.h)
+DEST_HASH_SIZE = 16
+NAME_HASH_LENGTH = 10
+DERIVED_KEY_LENGTH = 64
+
+# ===================================================================
+# ESP32 algorithm reimplementation (pure Python, mirrors src/crypto/)
+# ===================================================================
+
+
+def esp_sha256(data):
     return hashlib.sha256(data).digest()
 
-def esp32_hmac_sha256(key: bytes, data: bytes) -> bytes:
-    return hmac.new(key, data, hashlib.sha256).digest()
 
-def esp32_hkdf_sha256(ikm: bytes, salt: bytes, info: bytes, length: int) -> bytes:
-    """HKDF-SHA256 matching the Arduino Crypto HKDF<SHA256> library.
-    Extract: PRK = HMAC-SHA256(salt, ikm)
-    Expand:  output blocks using PRK, info, and counter."""
+def esp_hmac_sha256(key, data):
+    return hmac_mod.new(key, data, hashlib.sha256).digest()
+
+
+def esp_hkdf(ikm, salt, info, length):
+    """HKDF-SHA256 matching Arduino Crypto HKDF<SHA256>.
+    Extract: PRK = HMAC-SHA256(salt, IKM)
+    Expand:  T(i) = HMAC-SHA256(PRK, T(i-1) || info || i)"""
     if not salt:
-        salt = b'\x00' * 32
-    prk = esp32_hmac_sha256(salt, ikm)
-    block = b""
-    derived = b""
-    for i in range(ceil(length / 32)):
-        block = esp32_hmac_sha256(prk, block + info + bytes([(i + 1) % 256]))
-        derived += block
-    return derived[:length]
+        salt = b"\x00" * 32  # RFC 5869 default
+    prk = esp_hmac_sha256(salt, ikm)
+    t = b""
+    okm = b""
+    for i in range(1, ceil(length / 32) + 1):
+        t = esp_hmac_sha256(prk, t + info + bytes([i]))
+        okm += t
+    return okm[:length]
 
-def esp32_identity_hash(x25519_pub: bytes, ed25519_pub: bytes) -> bytes:
-    """identity_hash = SHA256(x25519_pub + ed25519_pub)[:16]"""
-    return esp32_sha256(x25519_pub + ed25519_pub)[:16]
 
-def esp32_destination_hash(full_name: str, identity_hash: bytes) -> bytes:
-    """dest_hash = SHA256(name_hash + identity_hash)[:16]
-    where name_hash = SHA256(full_name)[:10]"""
-    name_hash = esp32_sha256(full_name.encode("utf-8"))[:10]
-    return esp32_sha256(name_hash + identity_hash)[:16]
+def esp_identity_hash(x25519_pub, ed25519_pub):
+    """identity_hash = SHA-256(x25519_pub || ed25519_pub)[:16]"""
+    return esp_sha256(x25519_pub + ed25519_pub)[:16]
 
-def esp32_pkcs7_pad(data: bytes, block_size: int = 16) -> bytes:
-    pad_len = block_size - (len(data) % block_size)
+
+def esp_dest_hash(full_name, identity_hash):
+    """dest_hash = SHA-256(name_hash || identity_hash)[:16]
+    where name_hash = SHA-256(full_name.encode('utf-8'))[:10]"""
+    name_hash = esp_sha256(full_name.encode("utf-8"))[:10]
+    return esp_sha256(name_hash + identity_hash)[:16]
+
+
+def esp_pkcs7_pad(data, bs=16):
+    pad_len = bs - (len(data) % bs)
     return data + bytes([pad_len]) * pad_len
 
-def esp32_pkcs7_unpad(data: bytes) -> bytes:
+
+def esp_pkcs7_unpad(data):
     pad_len = data[-1]
     if pad_len < 1 or pad_len > 16:
         raise ValueError(f"Invalid PKCS7 padding: {pad_len}")
     if data[-pad_len:] != bytes([pad_len]) * pad_len:
-        raise ValueError("Invalid PKCS7 padding bytes")
+        raise ValueError("Corrupt PKCS7 padding")
     return data[:-pad_len]
 
-def esp32_token_encrypt(signing_key: bytes, encryption_key: bytes,
-                        plaintext: bytes, iv: bytes) -> bytes:
-    """Token encrypt: iv(16) + AES-256-CBC(PKCS7(plaintext)) + HMAC(signing_key, iv+ct)"""
-    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    padded = esp32_pkcs7_pad(plaintext)
-    cipher = Cipher(algorithms.AES(encryption_key), modes.CBC(iv))
-    enc = cipher.encryptor()
-    ciphertext = enc.update(padded) + enc.finalize()
-    signed_parts = iv + ciphertext
-    mac = esp32_hmac_sha256(signing_key, signed_parts)
-    return signed_parts + mac
 
-def esp32_token_decrypt(signing_key: bytes, encryption_key: bytes,
-                        token_data: bytes) -> bytes:
-    """Token decrypt: verify HMAC, then AES-256-CBC decrypt + PKCS7 unpad."""
+def esp_token_encrypt(signing_key, encryption_key, plaintext, iv):
+    """Token format: IV(16) + AES-256-CBC(PKCS7(plaintext)) + HMAC-SHA256(signing_key, IV+ct)(32)"""
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    padded = esp_pkcs7_pad(plaintext)
+    enc = Cipher(algorithms.AES(encryption_key), modes.CBC(iv)).encryptor()
+    ct = enc.update(padded) + enc.finalize()
+    mac = esp_hmac_sha256(signing_key, iv + ct)
+    return iv + ct + mac
+
+
+def esp_token_decrypt(signing_key, encryption_key, token_data):
+    """Verify HMAC, then AES-256-CBC decrypt + PKCS7 unpad."""
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
     if len(token_data) < 64:
         raise ValueError("Token too short")
-    received_hmac = token_data[-32:]
-    computed_hmac = esp32_hmac_sha256(signing_key, token_data[:-32])
-    if not hmac.compare_digest(received_hmac, computed_hmac):
-        raise ValueError("Token HMAC verification failed")
+    mac_got = token_data[-32:]
+    mac_exp = esp_hmac_sha256(signing_key, token_data[:-32])
+    if not hmac_mod.compare_digest(mac_got, mac_exp):
+        raise ValueError("Token HMAC mismatch")
     iv = token_data[:16]
-    ciphertext = token_data[16:-32]
-    cipher = Cipher(algorithms.AES(encryption_key), modes.CBC(iv))
-    dec = cipher.decryptor()
-    padded = dec.update(ciphertext) + dec.finalize()
-    return esp32_pkcs7_unpad(padded)
+    ct = token_data[16:-32]
+    dec = Cipher(algorithms.AES(encryption_key), modes.CBC(iv)).decryptor()
+    return esp_pkcs7_unpad(dec.update(ct) + dec.finalize())
 
-def esp32_announce_flags() -> int:
-    """Announce flags: HEADER_1(0), ctx_flag=0, BROADCAST(0), SINGLE(0), ANNOUNCE(1)"""
-    return (0 << 6) | (0 << 5) | (0 << 4) | (0 << 2) | 0x01
 
-def esp32_data_flags() -> int:
-    """Data flags: HEADER_1(0), ctx_flag=0, BROADCAST(0), SINGLE(0), DATA(0)"""
-    return (0 << 6) | (0 << 5) | (0 << 4) | (0 << 2) | 0x00
+# ===================================================================
+# Test harness
+# ===================================================================
 
-# ---------------------------------------------------------------------------
-# Test Harness
-# ---------------------------------------------------------------------------
+_passed = 0
+_failed = 0
 
-passed = 0
-failed = 0
 
 def test(name, condition, detail=""):
-    global passed, failed
+    global _passed, _failed
     if condition:
-        passed += 1
+        _passed += 1
         print(f"  PASS: {name}")
     else:
-        failed += 1
+        _failed += 1
         print(f"  FAIL: {name}")
         if detail:
             print(f"        {detail}")
 
-def hexdump(data: bytes) -> str:
-    return data.hex()
 
-# ---------------------------------------------------------------------------
-# Test 1a: Identity Hash Computation
-# ---------------------------------------------------------------------------
+# ===================================================================
+# Test 1a: Identity Hash Computation (using actual device keys)
+# ===================================================================
 
-def test_1a_identity_hash():
+
+def test_1a():
     print("\n=== Test 1a: Identity Hash Computation ===")
-
     import RNS
-    # Create a known identity in Python
-    identity = RNS.Identity(create_keys=True)
-    x25519_pub = identity.pub_bytes       # 32 bytes
-    ed25519_pub = identity.sig_pub_bytes  # 32 bytes
 
-    # Python RNS identity hash
-    rns_hash = identity.hash  # truncated_hash(pub_bytes + sig_pub_bytes)
+    for dev in [DEVICE_A, DEVICE_B]:
+        expected = bytes.fromhex(dev["expected_identity_hash"])
 
-    # ESP32 algorithm
-    esp32_hash = esp32_identity_hash(x25519_pub, ed25519_pub)
+        # --- Manual computation (ESP32 algorithm) ---
+        manual = esp_identity_hash(dev["x25519_pub"], dev["ed25519_pub"])
+        test(
+            f"{dev['name']}: manual identity hash",
+            manual == expected,
+            f"got {manual.hex()}, expected {expected.hex()}",
+        )
 
-    test("Identity hash matches RNS",
-         rns_hash == esp32_hash,
-         f"RNS={hexdump(rns_hash)} ESP32={hexdump(esp32_hash)}")
+        # --- RNS Identity (load private keys, derive public, compute hash) ---
+        identity = RNS.Identity(create_keys=False)
+        identity.load_private_key(dev["x25519_priv"] + dev["ed25519_priv"])
 
-    # Verify truncation length
-    test("Identity hash is 16 bytes", len(esp32_hash) == 16)
+        # Verify that Python-derived public keys match the ESP32-stored ones
+        test(
+            f"{dev['name']}: X25519 pub derivation matches stored",
+            identity.pub_bytes == dev["x25519_pub"],
+            f"derived {identity.pub_bytes.hex()}\nstored  {dev['x25519_pub'].hex()}",
+        )
+        test(
+            f"{dev['name']}: Ed25519 pub derivation matches stored",
+            identity.sig_pub_bytes == dev["ed25519_pub"],
+            f"derived {identity.sig_pub_bytes.hex()}\nstored  {dev['ed25519_pub'].hex()}",
+        )
 
-    # Verify full hash computation
-    full = esp32_sha256(x25519_pub + ed25519_pub)
-    rns_full = RNS.Identity.full_hash(x25519_pub + ed25519_pub)
-    test("Full SHA-256 matches", full == rns_full)
+        # Verify RNS identity hash matches the known device hash
+        test(
+            f"{dev['name']}: RNS identity hash matches expected",
+            identity.hash == expected,
+            f"RNS {identity.hash.hex()}, expected {expected.hex()}",
+        )
 
-    # Key order: X25519 first, Ed25519 second
-    wrong_order = esp32_sha256(ed25519_pub + x25519_pub)[:16]
-    test("Key order matters (wrong order != correct)",
-         wrong_order != esp32_hash,
-         "Both orders produced same hash — key order is irrelevant (unexpected)")
+    # Verify key order matters
+    wrong = esp_sha256(DEVICE_A["ed25519_pub"] + DEVICE_A["x25519_pub"])[:16]
+    right = bytes.fromhex(DEVICE_A["expected_identity_hash"])
+    test("Key order matters (X25519 first, Ed25519 second)", wrong != right)
 
 
-# ---------------------------------------------------------------------------
-# Test 1b: Destination Hash Computation
-# ---------------------------------------------------------------------------
+# ===================================================================
+# Test 1b: Destination Hash Computation (using actual device keys)
+# ===================================================================
 
-def test_1b_destination_hash():
+
+def test_1b():
     print("\n=== Test 1b: Destination Hash Computation ===")
-
     import RNS
 
-    identity = RNS.Identity(create_keys=True)
+    # Verify name_hash
+    name_hash_manual = esp_sha256(FULL_NAME.encode("utf-8"))[:10]
+    name_hash_rns = RNS.Identity.full_hash(FULL_NAME.encode("utf-8"))[:10]
+    test(
+        "name_hash computation matches RNS",
+        name_hash_manual == name_hash_rns,
+        f"manual {name_hash_manual.hex()}, RNS {name_hash_rns.hex()}",
+    )
 
-    # Python RNS destination hash
-    rns_dest_hash = RNS.Destination.hash(identity, "traildrop", "waypoint")
+    for dev in [DEVICE_A, DEVICE_B]:
+        expected = bytes.fromhex(dev["expected_dest_hash"])
+        id_hash = bytes.fromhex(dev["expected_identity_hash"])
 
-    # ESP32 algorithm
-    esp32_id_hash = esp32_identity_hash(identity.pub_bytes, identity.sig_pub_bytes)
-    esp32_dest = esp32_destination_hash("traildrop.waypoint", esp32_id_hash)
+        # --- Manual computation (ESP32 algorithm) ---
+        manual = esp_dest_hash(FULL_NAME, id_hash)
+        test(
+            f"{dev['name']}: manual dest hash",
+            manual == expected,
+            f"got {manual.hex()}, expected {expected.hex()}",
+        )
 
-    test("Destination hash matches RNS",
-         rns_dest_hash == esp32_dest,
-         f"RNS={hexdump(rns_dest_hash)} ESP32={hexdump(esp32_dest)}")
-
-    # Verify name_hash computation
-    rns_name_hash = RNS.Identity.full_hash("traildrop.waypoint".encode("utf-8"))[:10]
-    esp32_name_hash = esp32_sha256("traildrop.waypoint".encode("utf-8"))[:10]
-    test("Name hash matches (10 bytes)",
-         rns_name_hash == esp32_name_hash,
-         f"RNS={hexdump(rns_name_hash)} ESP32={hexdump(esp32_name_hash)}")
-
-    # Verify with known Device A values
-    # (Can only do if we have the actual keys — deferred to Part 2)
-    print("  INFO: Known device hash verification deferred to Part 2 (needs device keys)")
+        # --- RNS Destination.hash ---
+        identity = RNS.Identity(create_keys=False)
+        identity.load_private_key(dev["x25519_priv"] + dev["ed25519_priv"])
+        rns_dest = RNS.Destination.hash(identity, "traildrop", "waypoint")
+        test(
+            f"{dev['name']}: RNS dest hash matches expected",
+            rns_dest == expected,
+            f"RNS {rns_dest.hex()}, expected {expected.hex()}",
+        )
 
 
-# ---------------------------------------------------------------------------
-# Test 1c: Announce Packet Format
-# ---------------------------------------------------------------------------
+# ===================================================================
+# Test 1c: Announce Packet Format (using actual device keys)
+# ===================================================================
 
-def test_1c_announce_format():
+
+def test_1c():
     print("\n=== Test 1c: Announce Packet Format ===")
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+        Ed25519PrivateKey,
+        Ed25519PublicKey,
+    )
 
-    import RNS
-
-    identity = RNS.Identity(create_keys=True)
-
-    # Get key components
-    x25519_pub = identity.pub_bytes
-    ed25519_pub = identity.sig_pub_bytes
-    public_key = x25519_pub + ed25519_pub  # 64 bytes
-
-    # Compute hashes
-    id_hash = esp32_identity_hash(x25519_pub, ed25519_pub)
-    dest_hash = esp32_destination_hash("traildrop.waypoint", id_hash)
-    name_hash = esp32_sha256("traildrop.waypoint".encode("utf-8"))[:10]
+    dev = DEVICE_A
+    dest_hash = bytes.fromhex(dev["expected_dest_hash"])
+    public_key = dev["x25519_pub"] + dev["ed25519_pub"]  # 64 bytes
+    name_hash = esp_sha256(FULL_NAME.encode("utf-8"))[:10]
     random_hash = os.urandom(10)
     app_data = b"TestNode"
 
-    # Build signed_data the ESP32 way
+    # Build signed_data (ESP32 announce.cpp format):
+    #   dest_hash(16) + public_key(64) + name_hash(10) + random_hash(10) [+ app_data]
     signed_data = dest_hash + public_key + name_hash + random_hash + app_data
 
-    # Sign with identity
-    signature = identity.sign(signed_data)
+    # Sign with Ed25519 using actual device key
+    ed_prv = Ed25519PrivateKey.from_private_bytes(dev["ed25519_priv"])
+    signature = ed_prv.sign(signed_data)
+    test("Ed25519 signature is 64 bytes", len(signature) == 64)
 
-    # Build ESP32 announce payload
-    esp32_payload = public_key + name_hash + random_hash + signature + app_data
+    # Assemble payload (ESP32 announce.cpp format):
+    #   public_key(64) + name_hash(10) + random_hash(10) + signature(64) [+ app_data]
+    payload = public_key + name_hash + random_hash + signature + app_data
 
-    # Verify payload structure
-    test("Payload starts with public_key (64 bytes)",
-         esp32_payload[:64] == public_key)
-    test("Payload[64:74] is name_hash (10 bytes)",
-         esp32_payload[64:74] == name_hash)
-    test("Payload[74:84] is random_hash (10 bytes)",
-         esp32_payload[74:84] == random_hash)
-    test("Payload[84:148] is signature (64 bytes)",
-         esp32_payload[84:148] == signature)
-    test("Payload[148:] is app_data",
-         esp32_payload[148:] == app_data)
+    test(
+        "Payload structure: 148 + app_data",
+        len(payload) == 148 + len(app_data),
+        f"got {len(payload)}, expected {148 + len(app_data)}",
+    )
 
-    # Verify total payload size: 64+10+10+64+8 = 156
-    expected_len = 64 + 10 + 10 + 64 + len(app_data)
-    test(f"Payload length correct ({expected_len})",
-         len(esp32_payload) == expected_len)
+    # Parse payload back (as announce_process does)
+    p_x25519 = payload[0:32]
+    p_ed25519 = payload[32:64]
+    p_name_hash = payload[64:74]
+    p_random_hash = payload[74:84]
+    p_sig = payload[84:148]
+    p_app_data = payload[148:]
 
-    # Build full packet (HEADER_1 format)
-    flags = esp32_announce_flags()
-    hops = 0
-    context = 0x00  # CTX_NONE
-    raw_packet = bytes([flags, hops]) + dest_hash + bytes([context]) + esp32_payload
+    test("Extracted x25519_pub matches", p_x25519 == dev["x25519_pub"])
+    test("Extracted ed25519_pub matches", p_ed25519 == dev["ed25519_pub"])
+    test("Extracted name_hash matches", p_name_hash == name_hash)
+    test("Extracted app_data matches", p_app_data == app_data)
 
-    # Verify header size: flags(1) + hops(1) + dest_hash(16) + context(1) = 19
-    header_size = 1 + 1 + 16 + 1
-    test(f"Header size is 19", header_size == 19)
-    test(f"Total packet size: {len(raw_packet)}",
-         len(raw_packet) == header_size + len(esp32_payload))
+    # Verify signature using public key
+    ed_pub = Ed25519PublicKey.from_public_bytes(dev["ed25519_pub"])
+    verify_data = dest_hash + p_x25519 + p_ed25519 + p_name_hash + p_random_hash + p_app_data
+    try:
+        ed_pub.verify(p_sig, verify_data)
+        sig_valid = True
+    except Exception:
+        sig_valid = False
+    test("Signature validates against reconstructed signed_data", sig_valid)
 
-    # Verify flags byte
-    test("Flags: header_type=HEADER_1", (flags >> 6) & 0x01 == 0)
-    test("Flags: context_flag=0", (flags >> 5) & 0x01 == 0)
-    test("Flags: transport=BROADCAST", (flags >> 4) & 0x01 == 0)
-    test("Flags: dest_type=SINGLE", (flags >> 2) & 0x03 == 0)
-    test("Flags: pkt_type=ANNOUNCE", flags & 0x03 == 1)
-    test("Flags byte = 0x01", flags == 0x01)
+    # Verify dest_hash can be derived from announce payload
+    computed_id_hash = esp_identity_hash(p_x25519, p_ed25519)
+    computed_dest = esp_sha256(p_name_hash + computed_id_hash)[:16]
+    test(
+        "Dest hash derivable from announce payload",
+        computed_dest == dest_hash,
+        f"computed {computed_dest.hex()}, expected {dest_hash.hex()}",
+    )
 
-    # Now validate the announce using RNS.Identity.validate_announce
-    # We need to create a mock packet object that RNS expects
+    # Build full wire packet (HEADER_1)
+    # flags: HEADER_1(0), ctx=0, BROADCAST(0), SINGLE(0), ANNOUNCE(1) → 0x01
+    flags = 0x01
+    wire = bytes([flags, 0x00]) + dest_hash + bytes([0x00]) + payload
+    test("Wire packet header is 19 bytes", len(wire) - len(payload) == 19)
+    test("Flags byte = 0x01 (H1/broadcast/single/announce)", wire[0] == 0x01)
+
+    # Validate with RNS.Identity.validate_announce using mock packet
+    import RNS
+
     class MockPacket:
         pass
+
     mock = MockPacket()
     mock.packet_type = RNS.Packet.ANNOUNCE
     mock.destination_hash = dest_hash
     mock.context_flag = RNS.Packet.FLAG_UNSET
-    mock.data = esp32_payload
+    mock.data = payload
     mock.hops = 0
     mock.rssi = None
     mock.snr = None
     mock.receiving_interface = None
     mock.transport_id = None
 
-    # validate_announce with only_validate_signature=True
-    sig_valid = RNS.Identity.validate_announce(mock, only_validate_signature=True)
-    test("RNS validate_announce(signature) passes on ESP32-format announce",
-         sig_valid == True,
-         "Signature validation failed — format mismatch!")
-
-
-# ---------------------------------------------------------------------------
-# Test 1d: Encryption/Decryption Cross-Test
-# ---------------------------------------------------------------------------
-
-def test_1d_encryption():
-    print("\n=== Test 1d: Encryption/Decryption Cross-Test ===")
-
-    import RNS
-    from cryptography.hazmat.primitives.asymmetric.x25519 import (
-        X25519PrivateKey as PyCA_X25519PrivateKey,
-        X25519PublicKey as PyCA_X25519PublicKey,
+    validated = RNS.Identity.validate_announce(mock, only_validate_signature=True)
+    test(
+        "RNS validate_announce accepts ESP32-format announce",
+        validated is True,
+        "RNS rejected the announce — format mismatch!",
     )
 
-    # Create a target identity (the "recipient")
-    target = RNS.Identity(create_keys=True)
-    # Extract raw private key bytes for direct PyCA operations
-    target_prv_bytes = target.prv_bytes   # 32 bytes (x25519 private)
-    target_pub_bytes = target.pub_bytes   # 32 bytes (x25519 public)
 
-    # --- Python RNS encryption ---
+# ===================================================================
+# Test 1d: Encryption/Decryption Cross-Test (using actual device keys)
+# ===================================================================
+
+
+def test_1d():
+    print("\n=== Test 1d: Encryption/Decryption Cross-Test ===")
+    import RNS
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey,
+        X25519PublicKey,
+    )
+
+    # Load Device A into RNS
+    dev = DEVICE_A
+    identity_a = RNS.Identity(create_keys=False)
+    identity_a.load_private_key(dev["x25519_priv"] + dev["ed25519_priv"])
+    id_hash_a = bytes.fromhex(dev["expected_identity_hash"])
+
     plaintext = b"Hello from Python!"
-    rns_token = target.encrypt(plaintext)
 
-    # Verify encrypted format: ephemeral_pub(32) + iv(16) + ciphertext + hmac(32)
-    test("Encrypted token >= 96 bytes (32+16+16+32 minimum)",
-         len(rns_token) >= 96,
-         f"Token length: {len(rns_token)}")
+    # --- Test: RNS encrypt → ESP32-style decrypt ---
+    rns_ct = identity_a.encrypt(plaintext)
+    test(
+        "RNS ciphertext >= 96 bytes (eph_pub + iv + block + hmac)",
+        len(rns_ct) >= 96,
+        f"got {len(rns_ct)} bytes",
+    )
 
-    ephemeral_pub = rns_token[:32]
-    token_body = rns_token[32:]  # iv + ciphertext + hmac
+    eph_pub = rns_ct[:32]
+    token_body = rns_ct[32:]
     iv = token_body[:16]
     hmac_val = token_body[-32:]
-    ciphertext = token_body[16:-32]
+    aes_ct = token_body[16:-32]
 
-    test("Ephemeral public key is 32 bytes",
-         len(ephemeral_pub) == 32)
-    test("IV is 16 bytes", len(iv) == 16)
-    test("HMAC is 32 bytes", len(hmac_val) == 32)
-    test("Ciphertext is multiple of 16 (AES block)",
-         len(ciphertext) % 16 == 0,
-         f"Ciphertext length: {len(ciphertext)}")
+    test("Ephemeral pub = 32 bytes", len(eph_pub) == 32)
+    test("IV = 16 bytes", len(iv) == 16)
+    test("HMAC = 32 bytes", len(hmac_val) == 32)
+    test("AES ciphertext aligned to 16-byte blocks", len(aes_ct) % 16 == 0)
 
-    # Decrypt with Python RNS
-    decrypted = target.decrypt(rns_token)
-    test("RNS decrypt recovers plaintext",
-         decrypted == plaintext,
-         f"Got: {decrypted}")
+    # ESP32-style decrypt: ECDH → HKDF → Token decrypt
+    x25519_prv = X25519PrivateKey.from_private_bytes(dev["x25519_priv"])
+    eph_pub_key = X25519PublicKey.from_public_bytes(eph_pub)
+    shared = x25519_prv.exchange(eph_pub_key)
+    derived = esp_hkdf(shared, id_hash_a, b"", 64)
+    esp_dec = esp_token_decrypt(derived[:32], derived[32:], token_body)
 
-    # --- ESP32 algorithm decryption of RNS-encrypted token ---
-    # Use raw PyCA keys to avoid RNS proxy issues
-    eph_pub_obj = PyCA_X25519PublicKey.from_public_bytes(ephemeral_pub)
-    target_prv_obj = PyCA_X25519PrivateKey.from_private_bytes(target_prv_bytes)
-
-    # ECDH with recipient's private key
-    shared_key = target_prv_obj.exchange(eph_pub_obj)
-
-    # HKDF with identity_hash as salt
-    salt = target.hash  # identity_hash (16 bytes)
-    derived = esp32_hkdf_sha256(shared_key, salt, b"", 64)
-
-    # Token decrypt
-    signing_key = derived[:32]
-    encryption_key = derived[32:]
-    esp32_decrypted = esp32_token_decrypt(signing_key, encryption_key, token_body)
-
-    test("ESP32 algorithm decrypts RNS-encrypted data",
-         esp32_decrypted == plaintext,
-         f"Got: {esp32_decrypted}")
-
-    # --- ESP32 algorithm encryption, RNS decryption ---
-    plaintext2 = b"Hello from ESP32!"
-
-    # Generate ephemeral key using raw PyCA
-    eph_prv = PyCA_X25519PrivateKey.generate()
-    eph_pub_bytes = eph_prv.public_key().public_bytes_raw()
-
-    # ECDH with target's public key (using raw PyCA)
-    target_pub_obj = PyCA_X25519PublicKey.from_public_bytes(target_pub_bytes)
-    shared_key2 = eph_prv.exchange(target_pub_obj)
-
-    # HKDF
-    derived2 = esp32_hkdf_sha256(shared_key2, target.hash, b"", 64)
-    signing_key2 = derived2[:32]
-    encryption_key2 = derived2[32:]
-
-    # Token encrypt
-    iv2 = os.urandom(16)
-    token_body2 = esp32_token_encrypt(signing_key2, encryption_key2, plaintext2, iv2)
-    esp32_encrypted = eph_pub_bytes + token_body2
-
-    # Decrypt with RNS
-    rns_decrypted = target.decrypt(esp32_encrypted)
-    test("RNS decrypts ESP32-algorithm-encrypted data",
-         rns_decrypted == plaintext2,
-         f"Got: {rns_decrypted}")
-
-
-# ---------------------------------------------------------------------------
-# Test 1e: HKDF Derivation Match
-# ---------------------------------------------------------------------------
-
-def test_1e_hkdf():
-    print("\n=== Test 1e: HKDF Derivation Match ===")
-
-    import RNS.Cryptography
-
-    # Known test inputs
-    shared_key = bytes(range(32))  # deterministic test key
-    salt = bytes(range(16))        # deterministic 16-byte salt (identity_hash size)
-
-    # Python RNS HKDF
-    rns_derived = RNS.Cryptography.hkdf(
-        length=64,
-        derive_from=shared_key,
-        salt=salt,
-        context=None,  # Identity.get_context() returns None
+    test(
+        "ESP32 decrypt of RNS-encrypted data",
+        esp_dec == plaintext,
+        f"got {esp_dec!r}, expected {plaintext!r}",
     )
 
-    # ESP32 HKDF
-    esp32_derived = esp32_hkdf_sha256(shared_key, salt, b"", 64)
+    # --- Test: ESP32-style encrypt → RNS decrypt ---
+    plaintext2 = b"Hello from ESP32!"
+    eph_prv = X25519PrivateKey.generate()
+    eph_pub2 = eph_prv.public_key().public_bytes_raw()
+    target_pub = X25519PublicKey.from_public_bytes(dev["x25519_pub"])
+    shared2 = eph_prv.exchange(target_pub)
+    derived2 = esp_hkdf(shared2, id_hash_a, b"", 64)
+    iv2 = os.urandom(16)
+    token2 = esp_token_encrypt(derived2[:32], derived2[32:], plaintext2, iv2)
+    esp_ct = eph_pub2 + token2
 
-    test("HKDF output matches (64 bytes)",
-         rns_derived == esp32_derived,
-         f"RNS={hexdump(rns_derived[:16])}... ESP32={hexdump(esp32_derived[:16])}...")
+    rns_dec = identity_a.decrypt(esp_ct)
+    test(
+        "RNS decrypt of ESP32-encrypted data",
+        rns_dec == plaintext2,
+        f"got {rns_dec!r}, expected {plaintext2!r}",
+    )
+
+    # --- Test: Cross-device encrypt A→B, decrypt as B ---
+    dev_b = DEVICE_B
+    identity_b = RNS.Identity(create_keys=False)
+    identity_b.load_private_key(dev_b["x25519_priv"] + dev_b["ed25519_priv"])
+    id_hash_b = bytes.fromhex(dev_b["expected_identity_hash"])
+
+    plaintext3 = b"Hello from TrailDrop!"
+
+    # Simulate A encrypting TO B (ESP32 algorithm)
+    eph_prv3 = X25519PrivateKey.generate()
+    eph_pub3 = eph_prv3.public_key().public_bytes_raw()
+    b_pub = X25519PublicKey.from_public_bytes(dev_b["x25519_pub"])
+    shared3 = eph_prv3.exchange(b_pub)
+    derived3 = esp_hkdf(shared3, id_hash_b, b"", 64)  # salt = target's identity_hash
+    iv3 = os.urandom(16)
+    token3 = esp_token_encrypt(derived3[:32], derived3[32:], plaintext3, iv3)
+    esp_ct3 = eph_pub3 + token3
+
+    # B decrypts using RNS
+    rns_dec3 = identity_b.decrypt(esp_ct3)
+    test(
+        "Cross-device: ESP32 A→B encrypt, RNS B decrypt",
+        rns_dec3 == plaintext3,
+        f"got {rns_dec3!r}, expected {plaintext3!r}",
+    )
+
+    # RNS B encrypt, ESP32-style B decrypt
+    rns_ct4 = identity_b.encrypt(plaintext3)
+    eph4 = rns_ct4[:32]
+    tok4 = rns_ct4[32:]
+    b_prv = X25519PrivateKey.from_private_bytes(dev_b["x25519_priv"])
+    shared4 = b_prv.exchange(X25519PublicKey.from_public_bytes(eph4))
+    derived4 = esp_hkdf(shared4, id_hash_b, b"", 64)
+    esp_dec4 = esp_token_decrypt(derived4[:32], derived4[32:], tok4)
+    test(
+        "Cross-device: RNS B encrypt, ESP32-style B decrypt",
+        esp_dec4 == plaintext3,
+        f"got {esp_dec4!r}, expected {plaintext3!r}",
+    )
+
+
+# ===================================================================
+# Test 1e: HKDF Derivation Match
+# ===================================================================
+
+
+def test_1e():
+    print("\n=== Test 1e: HKDF Derivation Match ===")
+    import RNS.Cryptography
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (
+        X25519PrivateKey,
+        X25519PublicKey,
+    )
+
+    # --- Test with deterministic inputs ---
+    ikm = bytes(range(32))
+    salt = bytes(range(16))
+
+    rns_out = RNS.Cryptography.hkdf(length=64, derive_from=ikm, salt=salt, context=None)
+    esp_out = esp_hkdf(ikm, salt, b"", 64)
+    test(
+        "HKDF deterministic: RNS vs ESP32",
+        rns_out == esp_out,
+        f"RNS {rns_out[:16].hex()}...\nESP {esp_out[:16].hex()}...",
+    )
 
     # Verify key split
-    rns_signing = rns_derived[:32]
-    rns_encrypt = rns_derived[32:]
-    esp32_signing = esp32_derived[:32]
-    esp32_encrypt = esp32_derived[32:]
+    test("Signing key (first 32) matches", rns_out[:32] == esp_out[:32])
+    test("Encryption key (last 32) matches", rns_out[32:] == esp_out[32:])
+    test("Signing key != encryption key", rns_out[:32] != rns_out[32:])
 
-    test("Signing key (first 32 bytes) matches",
-         rns_signing == esp32_signing)
-    test("Encryption key (last 32 bytes) matches",
-         rns_encrypt == esp32_encrypt)
+    # --- Test with actual device A↔B ECDH shared key ---
+    a_prv = X25519PrivateKey.from_private_bytes(DEVICE_A["x25519_priv"])
+    b_pub = X25519PublicKey.from_public_bytes(DEVICE_B["x25519_pub"])
+    shared_ab = a_prv.exchange(b_pub)
 
-    # Test with empty salt (edge case)
-    rns_empty_salt = RNS.Cryptography.hkdf(
-        length=64, derive_from=shared_key, salt=b"", context=None)
-    esp32_empty_salt = esp32_hkdf_sha256(shared_key, b"", b"", 64)
-    test("HKDF with empty salt matches",
-         rns_empty_salt == esp32_empty_salt)
+    b_prv = X25519PrivateKey.from_private_bytes(DEVICE_B["x25519_priv"])
+    a_pub = X25519PublicKey.from_public_bytes(DEVICE_A["x25519_pub"])
+    shared_ba = b_prv.exchange(a_pub)
 
-    # Test with real ECDH shared key scenario
-    from cryptography.hazmat.primitives.asymmetric.x25519 import (
-        X25519PrivateKey as PyCA_X25519Prv,
+    test(
+        "ECDH symmetric: A→B == B→A",
+        shared_ab == shared_ba,
+        f"A→B {shared_ab.hex()}\nB→A {shared_ba.hex()}",
     )
 
-    alice_prv = PyCA_X25519Prv.generate()
-    bob_prv = PyCA_X25519Prv.generate()
+    # HKDF with B's identity_hash as salt (A encrypting TO B)
+    salt_b = bytes.fromhex(DEVICE_B["expected_identity_hash"])
+    rns_ab = RNS.Cryptography.hkdf(length=64, derive_from=shared_ab, salt=salt_b, context=None)
+    esp_ab = esp_hkdf(shared_ab, salt_b, b"", 64)
+    test(
+        "HKDF with real ECDH (A→B, salt=B.hash)",
+        rns_ab == esp_ab,
+        f"RNS {rns_ab[:16].hex()}...\nESP {esp_ab[:16].hex()}...",
+    )
 
-    shared_ab = alice_prv.exchange(bob_prv.public_key())
-
-    # Both sides should get the same HKDF output
-    identity_hash = esp32_sha256(os.urandom(64))[:16]  # simulated identity hash
-
-    rns_ab = RNS.Cryptography.hkdf(length=64, derive_from=shared_ab,
-                                    salt=identity_hash, context=None)
-    esp32_ab = esp32_hkdf_sha256(shared_ab, identity_hash, b"", 64)
-
-    test("HKDF with real ECDH shared key matches",
-         rns_ab == esp32_ab)
-
-
-# ---------------------------------------------------------------------------
-# Additional test: Packet hash computation
-# ---------------------------------------------------------------------------
-
-def test_packet_hash():
-    print("\n=== Test Bonus: Packet Hash Computation ===")
-
-    import RNS
-
-    # Build a raw HEADER_1 announce packet
-    flags = 0x01  # announce
-    hops = 0
-    dest_hash = os.urandom(16)
-    context = 0x00
-    payload = os.urandom(148)
-
-    raw = bytes([flags, hops]) + dest_hash + bytes([context]) + payload
-
-    # Python RNS hash computation (from Packet.get_hashable_part):
-    # hashable_part = bytes([raw[0] & 0x0F]) + raw[2:]  (for HEADER_1)
-    hashable_part = bytes([raw[0] & 0x0F]) + raw[2:]
-    rns_hash = hashlib.sha256(hashable_part).digest()
-
-    # ESP32 algorithm (from packet.cpp packet_hash):
-    # For HEADER_1: skip_offset=2, hashable = (flags & 0x0F) || raw[2:]
-    esp32_hashable = bytes([raw[0] & 0x0F]) + raw[2:]
-    esp32_hash = esp32_sha256(esp32_hashable)
-
-    test("Packet hash (HEADER_1) matches",
-         rns_hash == esp32_hash)
-
-    # HEADER_2 test
-    flags_h2 = 0x41  # header_type=1, announce
-    transport_id = os.urandom(16)
-    raw_h2 = bytes([flags_h2, hops]) + transport_id + dest_hash + bytes([context]) + payload
-
-    # RNS HEADER_2: hashable_part = bytes([raw[0] & 0x0F]) + raw[18:]
-    rns_hashable_h2 = bytes([raw_h2[0] & 0x0F]) + raw_h2[18:]
-    rns_hash_h2 = hashlib.sha256(rns_hashable_h2).digest()
-
-    # ESP32 HEADER_2: skip_offset=18, hashable = (flags & 0x0F) || raw[18:]
-    esp32_hashable_h2 = bytes([raw_h2[0] & 0x0F]) + raw_h2[18:]
-    esp32_hash_h2 = esp32_sha256(esp32_hashable_h2)
-
-    test("Packet hash (HEADER_2) matches",
-         rns_hash_h2 == esp32_hash_h2)
+    # HKDF with A's identity_hash as salt (B encrypting TO A)
+    salt_a = bytes.fromhex(DEVICE_A["expected_identity_hash"])
+    rns_ba = RNS.Cryptography.hkdf(length=64, derive_from=shared_ba, salt=salt_a, context=None)
+    esp_ba = esp_hkdf(shared_ba, salt_a, b"", 64)
+    test(
+        "HKDF with real ECDH (B→A, salt=A.hash)",
+        rns_ba == esp_ba,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Additional test: Token encrypt/decrypt round-trip
-# ---------------------------------------------------------------------------
+# ===================================================================
+# Bonus: Token round-trip
+# ===================================================================
+
 
 def test_token_roundtrip():
-    print("\n=== Test Bonus: Token Encrypt/Decrypt Round-Trip ===")
-
-    import RNS.Cryptography
+    print("\n=== Bonus: Token Encrypt/Decrypt Round-Trip ===")
     from RNS.Cryptography import Token
 
-    # Generate a 64-byte derived key
     derived = os.urandom(64)
+    rns_tok = Token(derived)
+    plaintext = b"TrailDrop waypoint payload"
 
-    # RNS Token
-    rns_token = Token(derived)
+    # RNS encrypt → ESP32 decrypt
+    rns_enc = rns_tok.encrypt(plaintext)
+    esp_dec = esp_token_decrypt(derived[:32], derived[32:], rns_enc)
+    test("ESP32 token_decrypt of RNS Token output", esp_dec == plaintext)
 
-    plaintext = b"TrailDrop waypoint data with coordinates"
-
-    # Encrypt with RNS Token
-    rns_encrypted = rns_token.encrypt(plaintext)
-
-    # Decrypt with ESP32 algorithm
-    signing_key = derived[:32]
-    encryption_key = derived[32:]
-    esp32_decrypted = esp32_token_decrypt(signing_key, encryption_key, rns_encrypted)
-    test("ESP32 token_decrypt decrypts RNS Token output",
-         esp32_decrypted == plaintext)
-
-    # Encrypt with ESP32 algorithm
+    # ESP32 encrypt → RNS decrypt
     iv = os.urandom(16)
-    esp32_encrypted = esp32_token_encrypt(signing_key, encryption_key, plaintext, iv)
-
-    # Decrypt with RNS Token
-    rns_decrypted = rns_token.decrypt(esp32_encrypted)
-    test("RNS Token decrypts ESP32 token_encrypt output",
-         rns_decrypted == plaintext)
+    esp_enc = esp_token_encrypt(derived[:32], derived[32:], plaintext, iv)
+    rns_dec = rns_tok.decrypt(esp_enc)
+    test("RNS Token decrypt of ESP32 token_encrypt output", rns_dec == plaintext)
 
 
-# ---------------------------------------------------------------------------
-# Additional test: Data packet format
-# ---------------------------------------------------------------------------
-
-def test_data_packet_format():
-    print("\n=== Test Bonus: Data Packet Wire Format ===")
-
-    import RNS
-
-    # Build a DATA packet the ESP32 way
-    flags = esp32_data_flags()
-    hops = 0
-    dest_hash = os.urandom(16)
-    context = 0x00
-
-    # Encrypted payload: ephemeral_pub(32) + token(iv+ct+hmac)
-    encrypted_payload = os.urandom(112)  # 32+16+32+32
-
-    raw = bytes([flags, hops]) + dest_hash + bytes([context]) + encrypted_payload
-
-    test("DATA flags byte = 0x00", flags == 0x00)
-    test("DATA packet structure: 19 header + payload",
-         len(raw) == 19 + len(encrypted_payload))
-
-    # Verify the RNS unpack would parse correctly
-    test("Flags: pkt_type=DATA", flags & 0x03 == 0)
-    test("Flags: dest_type=SINGLE", (flags >> 2) & 0x03 == 0)
+# ===================================================================
+# Bonus: Packet hash computation
+# ===================================================================
 
 
-# ---------------------------------------------------------------------------
+def test_packet_hash():
+    print("\n=== Bonus: Packet Hash Computation ===")
+
+    # HEADER_1 packet
+    flags = 0x01  # announce
+    raw = bytes([flags, 0x00]) + os.urandom(16) + bytes([0x00]) + os.urandom(148)
+
+    # ESP32 algorithm: hashable = (flags & 0x0F) || raw[2:]
+    hashable = bytes([raw[0] & 0x0F]) + raw[2:]
+    esp_hash = esp_sha256(hashable)
+
+    # RNS algorithm (Packet.get_hashable_part for HEADER_1): same
+    rns_hash = hashlib.sha256(bytes([raw[0] & 0x0F]) + raw[2:]).digest()
+    test("Packet hash HEADER_1 matches", esp_hash == rns_hash)
+
+    # HEADER_2 packet
+    flags_h2 = 0x41  # header_type=1, announce
+    raw_h2 = bytes([flags_h2, 0x00]) + os.urandom(16) + os.urandom(16) + bytes([0x00]) + os.urandom(100)
+
+    # ESP32: skip_offset=18, hashable = (flags & 0x0F) || raw[18:]
+    hashable_h2 = bytes([raw_h2[0] & 0x0F]) + raw_h2[18:]
+    esp_hash_h2 = esp_sha256(hashable_h2)
+    rns_hash_h2 = hashlib.sha256(bytes([raw_h2[0] & 0x0F]) + raw_h2[18:]).digest()
+    test("Packet hash HEADER_2 matches", esp_hash_h2 == rns_hash_h2)
+
+
+# ===================================================================
 # Main
-# ---------------------------------------------------------------------------
+# ===================================================================
 
 if __name__ == "__main__":
     print("=" * 60)
     print("Wire Compatibility Test: ESP32 TrailDrop ↔ Python Reticulum")
-    print("Part 1: Software Tests")
+    print("Part 1: Software Tests (actual device keys)")
     print("=" * 60)
 
-    # Run all tests
-    test_1a_identity_hash()
-    test_1b_destination_hash()
-    test_1c_announce_format()
-    test_1d_encryption()
-    test_1e_hkdf()
-    test_packet_hash()
+    test_1a()
+    test_1b()
+    test_1c()
+    test_1d()
+    test_1e()
     test_token_roundtrip()
-    test_data_packet_format()
+    test_packet_hash()
 
-    # Summary
-    total = passed + failed
-    print("\n" + "=" * 60)
-    print(f"Results: {passed}/{total} passed, {failed} failed")
-    print("=" * 60)
+    print(f"\n{'=' * 60}")
+    print(f"Results: {_passed}/{_passed + _failed} passed, {_failed} failed")
+    print(f"{'=' * 60}")
 
-    sys.exit(0 if failed == 0 else 1)
+    sys.exit(0 if _failed == 0 else 1)
