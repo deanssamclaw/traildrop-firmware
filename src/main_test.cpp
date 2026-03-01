@@ -33,6 +33,10 @@ static crypto::Identity device_identity;
 static net::Destination device_destination;
 static bool identity_ready = false;
 
+// Wire compat test: auto-send test message after discovering a peer
+static bool auto_send_pending = false;
+static uint32_t auto_send_time = 0;
+
 // Boot health tracking — single source of truth for init results
 struct BootHealth {
     bool power    = false;
@@ -1377,8 +1381,37 @@ void loop() {
 
     // --- Network polling ---
     if (identity_ready && boot.radio) {
+        // Track peer count before poll to detect new peers
+        static int prev_peer_count = 0;
+        int before_peers = net::peer_count();
+
         net::transport_poll();
-        
+
+        // Auto-send: arm when we first discover a peer
+        int after_peers = net::peer_count();
+        if (after_peers > before_peers && !auto_send_pending) {
+            auto_send_pending = true;
+            auto_send_time = now + 30000;  // 30 seconds from now
+            Serial.printf("[AUTO] Peer discovered (count %d→%d), will send test message in 30s\n",
+                          before_peers, after_peers);
+        }
+        prev_peer_count = after_peers;
+
+        // Auto-send: fire when timer expires
+        if (auto_send_pending && now >= auto_send_time) {
+            auto_send_pending = false;
+            const net::Peer* peer = net::peer_first();
+            if (peer) {
+                const char* msg = "Hello from TrailDrop!";
+                Serial.printf("[AUTO] Sending test message to peer %02x%02x%02x%02x...\n",
+                    peer->dest_hash[0], peer->dest_hash[1],
+                    peer->dest_hash[2], peer->dest_hash[3]);
+                net::transport_send_data(peer->dest_hash, (const uint8_t*)msg, strlen(msg));
+            } else {
+                Serial.println("[AUTO] No peers available for auto-send");
+            }
+        }
+
         // Periodic announce
         static uint32_t last_announce_check = 0;
         if (now - last_announce_check >= (ANNOUNCE_INTERVAL * 1000UL)) {

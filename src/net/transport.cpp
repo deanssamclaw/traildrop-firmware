@@ -41,6 +41,9 @@ bool transport_send(const Packet& pkt) {
     if (result == RADIOLIB_ERR_NONE) {
         s_tx_count++;
         Serial.printf("[TX] %d bytes, type=%d\n", len, pkt.get_packet_type());
+        Serial.print("[TX_HEX] ");
+        for (int i = 0; i < len; i++) Serial.printf("%02x", buf[i]);
+        Serial.println();
         return true;
     } else {
         Serial.printf("[TX] ERROR: radio_send failed with code %d\n", result);
@@ -106,7 +109,11 @@ void transport_poll() {
     if (rx_len <= 0) {
         return;  // Nothing received
     }
-    
+
+    Serial.print("[RX_HEX] ");
+    for (int i = 0; i < rx_len; i++) Serial.printf("%02x", rx_buf[i]);
+    Serial.println();
+
     // Deserialize packet
     Packet pkt;
     if (!packet_deserialize(rx_buf, rx_len, pkt)) {
