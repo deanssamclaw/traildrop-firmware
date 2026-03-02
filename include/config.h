@@ -61,6 +61,7 @@
 
 // --- Touch ---
 #define PIN_TOUCH_INT       16
+#define TOUCH_I2C_ADDR      0x5D
 
 // --- SD Card ---
 #define PIN_SDCARD_CS       39

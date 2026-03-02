@@ -31,7 +31,7 @@
 #include "msg/lxmf.h"
 #include "msg/lxmf_transport.h"
 #include "msg/waypoint.h"
-#include "ui/display_ui.h"
+#include "ui/ui.h"
 #include <RNG.h>
 
 // Device identity (global, used by networking later)
@@ -1718,9 +1718,14 @@ static void on_lxmf_received(const msg::LXMessage& msg, int rssi, float snr) {
             Serial.printf("[WAYPOINT] Sig: %s | RSSI=%d SNR=%.1f\n",
                           msg.signature_valid ? "VALID" : "INVALID", rssi, snr);
 
-            // Notify display UI
+            // Feed Cal's LVGL UI
             const net::Peer* sender = net::peer_lookup_by_lxmf_dest(msg.source_hash);
-            ui::ui_on_waypoint_received(wp, sender ? sender->app_data : "Unknown", rssi);
+            ui::ui_on_waypoint_received(
+                sender ? sender->app_data : "Unknown",
+                wp.name,
+                wp.lat, wp.lon, wp.ele,
+                app::WaypointCategory::INFO,
+                rssi);
         } else {
             Serial.printf("[WAYPOINT] Decode failed (data_len=%d)\n", msg.custom_data_len);
         }
@@ -2760,8 +2765,10 @@ void setup() {
 
     Serial.println("[BOOT] === Entering main loop ===\n");
 
-    // Phase 4d: Initialize display UI (shows boot screen, then transitions to main)
-    ui::ui_init();
+    // Phase 5: Initialize LVGL touch UI (shows boot screen, then transitions to main)
+    if (!ui::ui_init()) {
+        Serial.println("[BOOT] UI init failed");
+    }
     if (identity_ready) {
         ui::ui_set_send_context(&device_identity, device_lxmf_destination.hash);
     }
@@ -2847,12 +2854,22 @@ void loop() {
             net::transport_announce("TrailDrop");
         }
 
-        // Feed peer count to UI
-        ui::ui_set_peer_count(after_peers);
+        // Feed new peer discoveries to Cal's UI
+        if (after_peers > before_peers) {
+            const net::Peer* peer = net::peer_first();
+            if (peer && peer->app_data[0]) {
+                ui::ui_on_peer_discovered(peer->app_data, 0);
+            }
+        }
     }
 
-    // --- Phase 4d: Display UI handles all screen drawing + keyboard input ---
+    // --- Phase 5: LVGL UI update + keyboard forwarding ---
     ui::ui_update();
+
+    char key = hal::keyboard_read();
+    if (key) {
+        ui::ui_feed_key(key);
+    }
 
     // Stir RNG entropy pool — required for RNG.rand() to work after boot
     RNG.loop();
