@@ -2793,13 +2793,25 @@ void loop() {
                 Serial.printf("[AUTO] Sending LXMF to peer %02x%02x%02x%02x...\n",
                     peer->dest_hash[0], peer->dest_hash[1],
                     peer->dest_hash[2], peer->dest_hash[3]);
-                msg::lxmf_send(
+                bool sent = msg::lxmf_send(
                     device_identity, device_lxmf_destination.hash,
                     peer->dest_hash,
                     "Test", "Hello from TrailDrop!",
                     (const uint8_t*)"traildrop/waypoint", 18,
                     nullptr, 0,
                     msg_hash);
+                if (!sent) {
+                    // Radio may be busy — retry once after brief delay
+                    delay(100);
+                    Serial.println("[AUTO] Retrying send...");
+                    msg::lxmf_send(
+                        device_identity, device_lxmf_destination.hash,
+                        peer->dest_hash,
+                        "Test", "Hello from TrailDrop!",
+                        (const uint8_t*)"traildrop/waypoint", 18,
+                        nullptr, 0,
+                        msg_hash);
+                }
             } else {
                 Serial.println("[AUTO] No peers available for auto-send");
             }
