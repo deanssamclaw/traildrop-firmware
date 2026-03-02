@@ -27,6 +27,7 @@ namespace hal {
 
 bool display_init() {
     tft.init();
+    tft.invertDisplay(true); // T-Deck Plus ST7789 panel needs inversion toggled
     tft.setRotation(1); // Landscape: 320x240
     tft.fillScreen(TFT_BLACK);
     tft.setTextColor(TFT_WHITE, TFT_BLACK);
