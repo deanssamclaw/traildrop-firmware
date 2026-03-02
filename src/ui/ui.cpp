@@ -49,7 +49,7 @@ static void lvgl_flush_cb(lv_disp_drv_t* drv, const lv_area_t* area, lv_color_t*
     uint32_t h = area->y2 - area->y1 + 1;
     tft_ptr->startWrite();
     tft_ptr->setAddrWindow(area->x1, area->y1, w, h);
-    tft_ptr->pushColors((uint16_t*)&color_p->full, w * h, true);
+    tft_ptr->pushColors((uint16_t*)&color_p->full, w * h, false);
     tft_ptr->endWrite();
     lv_disp_flush_ready(drv);
 }
