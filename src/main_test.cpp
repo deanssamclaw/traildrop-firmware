@@ -6,6 +6,7 @@
 // ============================================================
 
 #include <Arduino.h>
+#include <Wire.h>
 #include <SPI.h>
 #include <SD.h>
 #include "config.h"
@@ -2684,6 +2685,25 @@ void setup() {
         net::transport_announce("TrailDrop");
         Serial.println("[NET] Transport initialized, LXMF transport ready, announce sent");
     }
+
+    // I2C bus scan (one-time diagnostic)
+    Serial.println("[I2C] Scanning bus...");
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        Wire.beginTransmission(addr);
+        if (Wire.endTransmission() == 0) {
+            Serial.printf("[I2C] Found 0x%02X", addr);
+            if (addr == 0x14) Serial.print(" (GT911-alt)");
+            if (addr == 0x15) Serial.print(" (CST816S)");
+            if (addr == 0x5D) Serial.print(" (GT911)");
+            if (addr == 0x55) Serial.print(" (Keyboard)");
+            if (addr == 0x38) Serial.print(" (FT6x36)");
+            if (addr == 0x48) Serial.print(" (AXP2101)");
+            if (addr == 0x1A) Serial.print(" (ES7210)");
+            if (addr == 0x18) Serial.print(" (ES8311)");
+            Serial.println();
+        }
+    }
+    Serial.println("[I2C] Scan complete");
 
     Serial.println("[BOOT] === Init complete ===\n");
     
