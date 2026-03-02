@@ -2816,10 +2816,14 @@ void loop() {
             }
         }
 
-        // Periodic announce
+        // Periodic announce (with random jitter to avoid sync collisions)
         static uint32_t last_announce_check = 0;
-        if (now - last_announce_check >= (ANNOUNCE_INTERVAL * 1000UL)) {
+        static uint32_t announce_jitter = (esp_random() % 30) * 1000UL;  // 0-30s random offset
+        // Re-announce faster (every 15s + jitter) when no peers found, normal interval otherwise
+        uint32_t interval = (after_peers == 0) ? 15000UL : (ANNOUNCE_INTERVAL * 1000UL);
+        if (now - last_announce_check >= (interval + announce_jitter)) {
             last_announce_check = now;
+            announce_jitter = (esp_random() % 10) * 1000UL;  // re-randomize for next cycle
             net::transport_announce("TrailDrop");
         }
 
