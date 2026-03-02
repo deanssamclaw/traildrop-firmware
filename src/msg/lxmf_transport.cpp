@@ -134,8 +134,8 @@ bool lxmf_send(
     // Step 5: Transmit via transport_send (handles serialization + radio)
     bool sent = net::transport_send(pkt);
     if (sent) {
-        Serial.printf("[LXMF-TX] Sent LXMF message (%d bytes LXMF, %d bytes encrypted)\n",
-                      (int)lxmf_len, (int)enc_len);
+        Serial.printf("[LXMF-TX] Sent LXMF message (%d bytes LXMF, %d bytes encrypted, ~%d bytes on wire)\n",
+                      (int)lxmf_len, (int)enc_len, (int)(enc_len + 18));
         // Record in dedup to avoid processing our own reflected packets
         lxmf_record_message(message_hash_out);
     }

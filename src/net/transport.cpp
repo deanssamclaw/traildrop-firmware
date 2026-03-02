@@ -36,6 +36,11 @@ bool transport_send(const Packet& pkt) {
         return false;
     }
     
+    if (len > 255) {
+        Serial.printf("[TX] ERROR: Packet too large for LoRa (%d > 255 bytes)\n", len);
+        return false;
+    }
+
     int result = hal::radio_send(buf, len);
     
     if (result == RADIOLIB_ERR_NONE) {
