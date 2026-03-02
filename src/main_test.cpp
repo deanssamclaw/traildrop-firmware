@@ -2796,19 +2796,18 @@ void loop() {
                 bool sent = msg::lxmf_send(
                     device_identity, device_lxmf_destination.hash,
                     peer->dest_hash,
-                    "Test", "Hello from TrailDrop!",
-                    (const uint8_t*)"traildrop/waypoint", 18,
+                    "Hi", "Hello!",
+                    nullptr, 0,
                     nullptr, 0,
                     msg_hash);
                 if (!sent) {
-                    // Radio may be busy — retry once after brief delay
                     delay(100);
                     Serial.println("[AUTO] Retrying send...");
                     msg::lxmf_send(
                         device_identity, device_lxmf_destination.hash,
                         peer->dest_hash,
-                        "Test", "Hello from TrailDrop!",
-                        (const uint8_t*)"traildrop/waypoint", 18,
+                        "Hi", "Hello!",
+                        nullptr, 0,
                         nullptr, 0,
                         msg_hash);
                 }
