@@ -2042,16 +2042,17 @@ static void run_phase4a5_tests(int& line) {
 
 static bool test_lxmf_send_receive_roundtrip() {
     // Full cycle: build LXMF, encrypt for peer, decrypt as peer, parse, verify
-    crypto::Identity alice, bob;
+    // Static buffers to avoid stack overflow on ESP32 (8KB task stack)
+    static crypto::Identity alice, bob;
     if (!crypto::identity_generate(alice)) return false;
     if (!crypto::identity_generate(bob)) return false;
 
-    net::Destination alice_lxmf, bob_lxmf;
+    static net::Destination alice_lxmf, bob_lxmf;
     if (!net::destination_derive(alice, "lxmf", "delivery", alice_lxmf)) return false;
     if (!net::destination_derive(bob, "lxmf", "delivery", bob_lxmf)) return false;
 
     // Build LXMF message from alice to bob
-    uint8_t lxmf_out[500];
+    static uint8_t lxmf_out[500];
     size_t lxmf_len = sizeof(lxmf_out);
     uint8_t message_hash[32];
 
@@ -2068,7 +2069,7 @@ static bool test_lxmf_send_receive_roundtrip() {
     }
 
     // Encrypt for bob
-    crypto::Identity bob_pub;
+    static crypto::Identity bob_pub;
     memcpy(bob_pub.x25519_public, bob.x25519_public, 32);
     memcpy(bob_pub.ed25519_public, bob.ed25519_public, 32);
     memcpy(bob_pub.hash, bob.hash, 16);
@@ -2076,7 +2077,7 @@ static bool test_lxmf_send_receive_roundtrip() {
     memset(bob_pub.ed25519_private, 0, 32);
     bob_pub.valid = true;
 
-    uint8_t encrypted[RNS_MTU];
+    static uint8_t encrypted[RNS_MTU];
     size_t enc_len = 0;
     if (!crypto::identity_encrypt(bob_pub, lxmf_out, lxmf_len, encrypted, &enc_len)) {
         Serial.println("[4B] Encrypt failed");
@@ -2084,7 +2085,7 @@ static bool test_lxmf_send_receive_roundtrip() {
     }
 
     // Decrypt as bob
-    uint8_t decrypted[RNS_MTU];
+    static uint8_t decrypted[RNS_MTU];
     size_t dec_len = 0;
     if (!crypto::identity_decrypt(bob, encrypted, enc_len, decrypted, &dec_len)) {
         Serial.println("[4B] Decrypt failed");
@@ -2098,7 +2099,7 @@ static bool test_lxmf_send_receive_roundtrip() {
     }
 
     // Reconstruct full LXMF: prepend bob's dest hash
-    uint8_t full_lxmf[600];
+    static uint8_t full_lxmf[600];
     memcpy(full_lxmf, bob_lxmf.hash, 16);
     memcpy(full_lxmf + 16, decrypted, dec_len);
 
@@ -2182,16 +2183,17 @@ static bool test_peer_lookup_by_lxmf_dest_fn() {
 
 static bool test_lxmf_receive_craft() {
     // Craft a known LXMF packet, decrypt/parse manually (simulates receive)
-    crypto::Identity sender, receiver;
+    // Static buffers to avoid stack overflow on ESP32
+    static crypto::Identity sender, receiver;
     if (!crypto::identity_generate(sender)) return false;
     if (!crypto::identity_generate(receiver)) return false;
 
-    net::Destination sender_lxmf, receiver_lxmf;
+    static net::Destination sender_lxmf, receiver_lxmf;
     if (!net::destination_derive(sender, "lxmf", "delivery", sender_lxmf)) return false;
     if (!net::destination_derive(receiver, "lxmf", "delivery", receiver_lxmf)) return false;
 
     // Build LXMF
-    uint8_t lxmf_out[500];
+    static uint8_t lxmf_out[500];
     size_t lxmf_len = sizeof(lxmf_out);
     uint8_t msg_hash[32];
 
@@ -2206,26 +2208,26 @@ static bool test_lxmf_receive_craft() {
     }
 
     // Encrypt for receiver
-    crypto::Identity receiver_pub;
+    static crypto::Identity receiver_pub;
     memcpy(receiver_pub.x25519_public, receiver.x25519_public, 32);
     memcpy(receiver_pub.hash, receiver.hash, 16);
     receiver_pub.valid = true;
 
-    uint8_t encrypted[RNS_MTU];
+    static uint8_t encrypted[RNS_MTU];
     size_t enc_len = 0;
     if (!crypto::identity_encrypt(receiver_pub, lxmf_out, lxmf_len, encrypted, &enc_len)) {
         return false;
     }
 
     // Decrypt as receiver
-    uint8_t decrypted[RNS_MTU];
+    static uint8_t decrypted[RNS_MTU];
     size_t dec_len = 0;
     if (!crypto::identity_decrypt(receiver, encrypted, enc_len, decrypted, &dec_len)) {
         return false;
     }
 
     // Reconstruct full LXMF
-    uint8_t full_lxmf[600];
+    static uint8_t full_lxmf[600];
     memcpy(full_lxmf, receiver_lxmf.hash, 16);
     memcpy(full_lxmf + 16, decrypted, dec_len);
 
@@ -2348,13 +2350,14 @@ static bool test_waypoint_encode_python_match() {
 
 static bool test_waypoint_in_lxmf_roundtrip() {
     // Build LXMF with waypoint custom fields, parse, extract waypoint
-    crypto::Identity sender;
+    // Static buffers to avoid stack overflow on ESP32
+    static crypto::Identity sender;
     if (!crypto::identity_generate(sender)) return false;
 
-    net::Destination sender_lxmf, receiver_lxmf;
+    static net::Destination sender_lxmf, receiver_lxmf;
     if (!net::destination_derive(sender, "lxmf", "delivery", sender_lxmf)) return false;
 
-    crypto::Identity receiver;
+    static crypto::Identity receiver;
     if (!crypto::identity_generate(receiver)) return false;
     if (!net::destination_derive(receiver, "lxmf", "delivery", receiver_lxmf)) return false;
 
@@ -2368,12 +2371,12 @@ static bool test_waypoint_in_lxmf_roundtrip() {
     strncpy(wp.notes, "Water source", sizeof(wp.notes) - 1);
     wp.timestamp = 1709312400;
 
-    uint8_t custom_data[256];
+    static uint8_t custom_data[256];
     size_t custom_data_len = msg::waypoint_encode(wp, custom_data, sizeof(custom_data));
     if (custom_data_len == 0) return false;
 
     // Build LXMF with custom fields
-    uint8_t lxmf_out[500];
+    static uint8_t lxmf_out[500];
     size_t lxmf_len = sizeof(lxmf_out);
     uint8_t message_hash[32];
 
